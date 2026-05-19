@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use crate::{
+    structure::class::Constant,
     structure::class::{ClassFile, Method, MethodInfoAttribute},
     vm::{
         constant::ConstantPoolExt,
@@ -23,6 +26,7 @@ pub struct RuntimeClass {
     pub id: ClassId,
     pub name: String,
     pub methods: Vec<RuntimeMethod>,
+    pub method_refs: HashMap<CpIndex, RuntimeMethodRef>,
     pub state: ClassState,
 }
 
@@ -38,11 +42,13 @@ impl RuntimeClass {
             .enumerate()
             .map(|(index, method)| RuntimeMethod::from_method(MethodId(index), class_file, method))
             .collect::<Result<Vec<_>, _>>()?;
+        let method_refs = collect_method_refs(class_file)?;
 
         Ok(Self {
             id,
             name,
             methods,
+            method_refs,
             state: ClassState::Loaded,
         })
     }
@@ -52,6 +58,13 @@ impl RuntimeClass {
             .iter()
             .find(|method| method.name == name && method.descriptor_source == descriptor)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMethodRef {
+    pub class_name: String,
+    pub name: String,
+    pub descriptor: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,4 +110,37 @@ impl RuntimeMethod {
             code: decoded_code,
         })
     }
+}
+
+fn collect_method_refs(
+    class_file: &ClassFile,
+) -> Result<HashMap<CpIndex, RuntimeMethodRef>, VmError> {
+    let mut refs = HashMap::new();
+
+    for (zero_based_index, constant) in class_file.constant_pool.constants.iter().enumerate() {
+        if let Constant::Methodref {
+            class_index,
+            name_and_type_index,
+        } = constant
+        {
+            let cp_index = CpIndex((zero_based_index + 1) as u16);
+            let class_name = class_file
+                .constant_pool
+                .class_name(ClassIndex(*class_index))?;
+            let (name, descriptor) = class_file
+                .constant_pool
+                .name_and_type(CpIndex(*name_and_type_index))?;
+
+            refs.insert(
+                cp_index,
+                RuntimeMethodRef {
+                    class_name,
+                    name,
+                    descriptor,
+                },
+            );
+        }
+    }
+
+    Ok(refs)
 }

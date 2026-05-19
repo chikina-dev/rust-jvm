@@ -25,6 +25,7 @@ impl MethodArea {
             id,
             name: name.clone(),
             methods: Vec::new(),
+            method_refs: HashMap::new(),
             state: crate::vm::class::ClassState::Loaded,
         });
         self.class_by_name.insert(name, id);

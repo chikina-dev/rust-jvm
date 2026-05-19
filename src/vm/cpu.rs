@@ -1,6 +1,8 @@
 use crate::vm::{
+    class::RuntimeMethodRef,
     error::{UnsupportedFeature, VmError},
-    ids::ThreadId,
+    frame::Frame,
+    ids::{CpIndex, ThreadId},
     instruction::{DecodedInstruction, DecodedInstructionKind},
     memory::VirtualMemory,
     value::Value,
@@ -206,6 +208,9 @@ impl VirtualCpu {
                 self.set_pc(memory, instruction.next_pc)?;
                 Ok(StepResult::Continue)
             }
+            DecodedInstructionKind::InvokeStatic(index) => {
+                self.invoke_static_instruction(memory, instruction, *index)
+            }
             DecodedInstructionKind::IReturn => {
                 let value = Value::Int(self.pop_int(memory)?);
                 self.return_from_frame(memory, Some(value))
@@ -273,6 +278,100 @@ impl VirtualCpu {
         Ok(StepResult::Continue)
     }
 
+    fn invoke_static_instruction(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let method_ref = self.resolve_method_ref(memory, index)?;
+        let class_id = memory
+            .method_area
+            .class_id(&method_ref.class_name)
+            .ok_or_else(|| VmError::ClassNotFound(method_ref.class_name.clone()))?;
+        let (method_id, max_locals, code, parameter_count) = {
+            let class = memory
+                .method_area
+                .class(class_id)
+                .ok_or_else(|| VmError::ClassNotFound(method_ref.class_name.clone()))?;
+            let method = class
+                .find_method(&method_ref.name, &method_ref.descriptor)
+                .ok_or_else(|| VmError::NoSuchMethod {
+                    class: method_ref.class_name.clone(),
+                    name: method_ref.name.clone(),
+                    descriptor: method_ref.descriptor.clone(),
+                })?;
+            let code = method.code.clone().ok_or_else(|| {
+                VmError::UnsupportedFeature(UnsupportedFeature::NativeMethod {
+                    class: method_ref.class_name.clone(),
+                    name: method_ref.name.clone(),
+                    descriptor: method_ref.descriptor.clone(),
+                })
+            })?;
+
+            (
+                method.id,
+                method.max_locals as usize,
+                code,
+                method.descriptor.parameters.len(),
+            )
+        };
+
+        let mut args = Vec::with_capacity(parameter_count);
+        for _ in 0..parameter_count {
+            args.push(self.pop_value(memory)?);
+        }
+        args.reverse();
+
+        self.set_pc(memory, instruction.next_pc)?;
+
+        let mut frame = Frame::new(class_id, method_id, max_locals, code);
+        for (index, value) in args.into_iter().enumerate() {
+            let local = frame.locals.get_mut(index).ok_or_else(|| {
+                VmError::VerificationError(format!("local {index} does not exist"))
+            })?;
+            *local = value;
+        }
+
+        memory
+            .thread_mut(self.current_thread)
+            .ok_or_else(|| {
+                VmError::InternalError(format!("thread {:?} does not exist", self.current_thread))
+            })?
+            .push_frame(frame);
+
+        Ok(StepResult::Continue)
+    }
+
+    fn resolve_method_ref(
+        &self,
+        memory: &VirtualMemory,
+        index: CpIndex,
+    ) -> Result<RuntimeMethodRef, VmError> {
+        let thread = memory.thread(self.current_thread).ok_or_else(|| {
+            VmError::InternalError(format!("thread {:?} does not exist", self.current_thread))
+        })?;
+        let frame = thread.current_frame().ok_or_else(|| {
+            VmError::InternalError(format!(
+                "thread {:?} has no current frame",
+                self.current_thread
+            ))
+        })?;
+        let class = memory
+            .method_area
+            .class(frame.class_id)
+            .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", frame.class_id)))?;
+
+        class
+            .method_refs
+            .get(&index)
+            .cloned()
+            .ok_or_else(|| VmError::ConstantResolution {
+                index,
+                reason: "expected Methodref constant".to_string(),
+            })
+    }
+
     fn return_from_frame(
         &self,
         memory: &mut VirtualMemory,
@@ -303,15 +402,19 @@ impl VirtualCpu {
         Ok(())
     }
 
+    fn pop_value(&self, memory: &mut VirtualMemory) -> Result<Value, VmError> {
+        self.current_frame_mut(memory)?
+            .operand_stack
+            .pop()
+            .ok_or_else(|| VmError::VerificationError("operand stack underflow".to_string()))
+    }
+
     fn pop_int(&self, memory: &mut VirtualMemory) -> Result<i32, VmError> {
-        match self.current_frame_mut(memory)?.operand_stack.pop() {
-            Some(Value::Int(value)) => Ok(value),
-            Some(value) => Err(VmError::VerificationError(format!(
+        match self.pop_value(memory)? {
+            Value::Int(value) => Ok(value),
+            value => Err(VmError::VerificationError(format!(
                 "expected int on operand stack, found {value:?}"
             ))),
-            None => Err(VmError::VerificationError(
-                "operand stack underflow".to_string(),
-            )),
         }
     }
 
@@ -392,6 +495,7 @@ impl MnemonicFallback for DecodedInstructionKind {
             DecodedInstructionKind::IfICmpGt(_) => "if_icmpgt",
             DecodedInstructionKind::IfICmpLe(_) => "if_icmple",
             DecodedInstructionKind::IInc { .. } => "iinc",
+            DecodedInstructionKind::InvokeStatic(_) => "invokestatic",
             _ => "unsupported",
         }
     }

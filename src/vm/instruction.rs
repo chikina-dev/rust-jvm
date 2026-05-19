@@ -41,6 +41,7 @@ pub enum DecodedInstructionKind {
     IfICmpGt(i16),
     IfICmpLe(i16),
     IInc { index: u16, value: i16 },
+    InvokeStatic(CpIndex),
     Return,
     IReturn,
     Unsupported { mnemonic: &'static str },
@@ -130,6 +131,9 @@ fn decode_kind(byte: &CodeByte) -> Result<DecodedInstructionKind, ParseError> {
         0xa7 => Ok(DecodedInstructionKind::Goto(read_i16(byte)?)),
         0xac => Ok(DecodedInstructionKind::IReturn),
         0xb1 => Ok(DecodedInstructionKind::Return),
+        0xb8 => Ok(DecodedInstructionKind::InvokeStatic(CpIndex(read_u16(
+            byte,
+        )?))),
         _ => Ok(DecodedInstructionKind::Unsupported {
             mnemonic: byte.name,
         }),
