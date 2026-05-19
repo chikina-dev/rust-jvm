@@ -3,9 +3,9 @@ use crate::{
     vm::{
         class::RuntimeClass,
         cpu::VirtualCpu,
-        error::{UnsupportedFeature, VmError},
-        frame::Frame,
+        error::VmError,
         ids::ClassId,
+        invocation::ResolvedMethod,
         loader::{ClassLoader, ClassSource},
         memory::{Array, VirtualMemory},
         value::Value,
@@ -53,42 +53,10 @@ impl Vm {
         descriptor: &str,
         args: Vec<Value>,
     ) -> Result<Option<Value>, VmError> {
-        let class_id = self
-            .memory
-            .method_area
-            .class_id(class_name)
-            .ok_or_else(|| VmError::ClassNotFound(class_name.to_string()))?;
-        let class = self
-            .memory
-            .method_area
-            .class(class_id)
-            .ok_or_else(|| VmError::ClassNotFound(class_name.to_string()))?;
-        let method =
-            class
-                .find_method(method_name, descriptor)
-                .ok_or_else(|| VmError::NoSuchMethod {
-                    class: class_name.to_string(),
-                    name: method_name.to_string(),
-                    descriptor: descriptor.to_string(),
-                })?;
-        let code = method.code.clone().ok_or_else(|| {
-            VmError::UnsupportedFeature(UnsupportedFeature::NativeMethod {
-                class: class_name.to_string(),
-                name: method_name.to_string(),
-                descriptor: descriptor.to_string(),
-            })
-        })?;
-        let method_id = method.id;
-        let max_locals = method.max_locals as usize;
+        let method = ResolvedMethod::resolve(&self.memory, class_name, method_name, descriptor)?;
 
         let thread_id = self.memory.create_thread();
-        let mut frame = Frame::new(class_id, method_id, max_locals, code);
-        for (index, value) in args.into_iter().enumerate() {
-            let local = frame.locals.get_mut(index).ok_or_else(|| {
-                VmError::VerificationError(format!("local {index} does not exist"))
-            })?;
-            *local = value;
-        }
+        let frame = method.frame_with_args(args)?;
 
         self.memory
             .thread_mut(thread_id)
@@ -99,7 +67,7 @@ impl Vm {
 
         let mut cpu = VirtualCpu::new(thread_id);
         if method_name != "<clinit>" {
-            cpu.ensure_class_initialized(&mut self.memory, class_id)?;
+            cpu.ensure_class_initialized(&mut self.memory, method.class_id)?;
         }
         cpu.run_until_return(&mut self.memory)
     }

@@ -6,6 +6,7 @@ use crate::vm::{
     frame::Frame,
     ids::{CpIndex, ObjectRef, ThreadId},
     instruction::{DecodedInstruction, DecodedInstructionKind},
+    invocation::ResolvedMethod,
     memory::{Array, HeapEntry, VirtualMemory},
     value::Value,
 };
@@ -623,56 +624,21 @@ impl VirtualCpu {
         index: CpIndex,
     ) -> Result<StepResult, VmError> {
         let method_ref = self.resolve_method_ref(memory, index)?;
-        let class_id = memory
-            .method_area
-            .class_id(&method_ref.class_name)
-            .ok_or_else(|| VmError::ClassNotFound(method_ref.class_name.clone()))?;
-        if method_ref.name != "<clinit>" && self.ensure_class_initialized(memory, class_id)? {
+        let method = ResolvedMethod::resolve(
+            memory,
+            &method_ref.class_name,
+            &method_ref.name,
+            &method_ref.descriptor,
+        )?;
+        if method.name != "<clinit>" && self.ensure_class_initialized(memory, method.class_id)? {
             return Ok(StepResult::Continue);
         }
-        let (method_id, max_locals, code, parameter_count) = {
-            let class = memory
-                .method_area
-                .class(class_id)
-                .ok_or_else(|| VmError::ClassNotFound(method_ref.class_name.clone()))?;
-            let method = class
-                .find_method(&method_ref.name, &method_ref.descriptor)
-                .ok_or_else(|| VmError::NoSuchMethod {
-                    class: method_ref.class_name.clone(),
-                    name: method_ref.name.clone(),
-                    descriptor: method_ref.descriptor.clone(),
-                })?;
-            let code = method.code.clone().ok_or_else(|| {
-                VmError::UnsupportedFeature(UnsupportedFeature::NativeMethod {
-                    class: method_ref.class_name.clone(),
-                    name: method_ref.name.clone(),
-                    descriptor: method_ref.descriptor.clone(),
-                })
-            })?;
 
-            (
-                method.id,
-                method.max_locals as usize,
-                code,
-                method.descriptor.parameters.len(),
-            )
-        };
-
-        let mut args = Vec::with_capacity(parameter_count);
-        for _ in 0..parameter_count {
-            args.push(self.pop_value(memory)?);
-        }
-        args.reverse();
+        let args = self.pop_arguments(memory, method.parameter_count)?;
 
         self.set_pc(memory, instruction.next_pc)?;
 
-        let mut frame = Frame::new(class_id, method_id, max_locals, code);
-        for (index, value) in args.into_iter().enumerate() {
-            let local = frame.locals.get_mut(index).ok_or_else(|| {
-                VmError::VerificationError(format!("local {index} does not exist"))
-            })?;
-            *local = value;
-        }
+        let frame = method.frame_with_args(args)?;
 
         memory
             .thread_mut(self.current_thread)
@@ -691,10 +657,6 @@ impl VirtualCpu {
         index: CpIndex,
     ) -> Result<StepResult, VmError> {
         let method_ref = self.resolve_method_ref(memory, index)?;
-        let parameter_count =
-            crate::vm::descriptor::parse_method_descriptor(&method_ref.descriptor)?
-                .parameters
-                .len();
 
         if method_ref.class_name == "java/lang/Object"
             && method_ref.name == "<init>"
@@ -710,38 +672,13 @@ impl VirtualCpu {
             return Ok(StepResult::Continue);
         }
 
-        let class_id = memory
-            .method_area
-            .class_id(&method_ref.class_name)
-            .ok_or_else(|| VmError::ClassNotFound(method_ref.class_name.clone()))?;
-        let (method_id, max_locals, code) = {
-            let class = memory
-                .method_area
-                .class(class_id)
-                .ok_or_else(|| VmError::ClassNotFound(method_ref.class_name.clone()))?;
-            let method = class
-                .find_method(&method_ref.name, &method_ref.descriptor)
-                .ok_or_else(|| VmError::NoSuchMethod {
-                    class: method_ref.class_name.clone(),
-                    name: method_ref.name.clone(),
-                    descriptor: method_ref.descriptor.clone(),
-                })?;
-            let code = method.code.clone().ok_or_else(|| {
-                VmError::UnsupportedFeature(UnsupportedFeature::NativeMethod {
-                    class: method_ref.class_name.clone(),
-                    name: method_ref.name.clone(),
-                    descriptor: method_ref.descriptor.clone(),
-                })
-            })?;
-
-            (method.id, method.max_locals as usize, code)
-        };
-
-        let mut args = Vec::with_capacity(parameter_count);
-        for _ in 0..parameter_count {
-            args.push(self.pop_value(memory)?);
-        }
-        args.reverse();
+        let method = ResolvedMethod::resolve(
+            memory,
+            &method_ref.class_name,
+            &method_ref.name,
+            &method_ref.descriptor,
+        )?;
+        let args = self.pop_arguments(memory, method.parameter_count)?;
         let object = self.pop_ref(memory)?;
         if object.is_none() {
             return Err(VmError::RuntimeException(
@@ -751,19 +688,7 @@ impl VirtualCpu {
 
         self.set_pc(memory, instruction.next_pc)?;
 
-        let mut frame = Frame::new(class_id, method_id, max_locals, code);
-        let receiver = frame
-            .locals
-            .get_mut(0)
-            .ok_or_else(|| VmError::VerificationError("local 0 does not exist".to_string()))?;
-        *receiver = Value::Ref(object);
-        for (index, value) in args.into_iter().enumerate() {
-            let local_index = index + 1;
-            let local = frame.locals.get_mut(local_index).ok_or_else(|| {
-                VmError::VerificationError(format!("local {local_index} does not exist"))
-            })?;
-            *local = value;
-        }
+        let frame = method.frame_with_receiver_and_args(object, args)?;
 
         memory
             .thread_mut(self.current_thread)
@@ -1285,6 +1210,19 @@ impl VirtualCpu {
             .operand_stack
             .pop()
             .ok_or_else(|| VmError::VerificationError("operand stack underflow".to_string()))
+    }
+
+    fn pop_arguments(
+        &self,
+        memory: &mut VirtualMemory,
+        parameter_count: usize,
+    ) -> Result<Vec<Value>, VmError> {
+        let mut args = Vec::with_capacity(parameter_count);
+        for _ in 0..parameter_count {
+            args.push(self.pop_value(memory)?);
+        }
+        args.reverse();
+        Ok(args)
     }
 
     fn pop_ref(&self, memory: &mut VirtualMemory) -> Result<Option<ObjectRef>, VmError> {
