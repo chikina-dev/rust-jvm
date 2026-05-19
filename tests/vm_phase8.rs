@@ -90,6 +90,6 @@ fn creates_stores_and_reads_reference_array_from_parsed_class_file() {
 
     assert_eq!(
         vm.invoke_static("Phase8ReferenceArrayMain", "main", "()I", vec![]),
-        Ok(Some(Value::Int(11)))
+        Ok(Some(Value::Int(13)))
     );
 }

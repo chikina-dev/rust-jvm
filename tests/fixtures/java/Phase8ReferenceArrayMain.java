@@ -6,8 +6,9 @@ public class Phase8ReferenceArrayMain {
     }
 
     public static int main() {
-        Phase8ReferenceArrayMain[] values = new Phase8ReferenceArrayMain[1];
-        values[0] = new Phase8ReferenceArrayMain(11);
-        return values[0].value;
+        Phase8ReferenceArrayMain[] values = new Phase8ReferenceArrayMain[2];
+        values[0] = null;
+        values[1] = new Phase8ReferenceArrayMain(11);
+        return values.length + values[1].value;
     }
 }
