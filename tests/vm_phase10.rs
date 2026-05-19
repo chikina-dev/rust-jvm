@@ -100,8 +100,8 @@ fn loads_classes_from_in_memory_class_source() {
     let mut vm = Vm::new();
 
     let class_ids = loader
-        .load_classes(["Phase7CrossClassMain", "Phase7Helper"], &mut vm.memory)
-        .expect("classes should load from in-memory source");
+        .load_available_class_closure("Phase7CrossClassMain", &mut vm.memory)
+        .expect("available class closure should load from in-memory source");
     let duplicate_id = vm
         .load_class_from_source(&mut loader, "Phase7CrossClassMain")
         .expect("duplicate class load should return existing class id");
@@ -122,10 +122,9 @@ fn loads_classes_from_file_system_class_source() {
     let mut loader = ClassLoader::new(source);
     let mut vm = Vm::new();
 
-    vm.load_class_from_source(&mut loader, "Phase7CrossClassMain")
-        .expect("main class should load from file system source");
-    vm.load_class_from_source(&mut loader, "Phase7Helper")
-        .expect("helper class should load from file system source");
+    loader
+        .load_available_class_closure("Phase7CrossClassMain", &mut vm.memory)
+        .expect("available class closure should load from file system source");
 
     assert_eq!(
         vm.invoke_static("Phase7CrossClassMain", "main", "()I", vec![]),

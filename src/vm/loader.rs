@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
 };
@@ -16,6 +16,10 @@ use crate::{
 
 pub trait ClassSource {
     fn load_class_bytes(&self, binary_name: &str) -> Result<Vec<u8>, VmError>;
+
+    fn has_class(&self, binary_name: &str) -> bool {
+        self.load_class_bytes(binary_name).is_ok()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -44,6 +48,10 @@ impl ClassSource for InMemoryClassSource {
             .cloned()
             .ok_or_else(|| VmError::ClassNotFound(binary_name.to_string()))
     }
+
+    fn has_class(&self, binary_name: &str) -> bool {
+        self.classes.contains_key(binary_name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +76,10 @@ impl ClassSource for FileSystemClassSource {
         let path = self.class_path(binary_name);
         fs::read(&path)
             .map_err(|error| VmError::ClassNotFound(format!("{} ({})", binary_name, error)))
+    }
+
+    fn has_class(&self, binary_name: &str) -> bool {
+        self.class_path(binary_name).is_file()
     }
 }
 
@@ -142,6 +154,66 @@ impl<S: ClassSource> ClassLoader<S> {
             .into_iter()
             .map(|binary_name| self.load_class(binary_name.as_ref(), memory))
             .collect()
+    }
+
+    pub fn load_available_class_closure(
+        &mut self,
+        root_binary_name: &str,
+        memory: &mut VirtualMemory,
+    ) -> Result<Vec<ClassId>, VmError> {
+        let mut loaded_ids = Vec::new();
+        let mut queued = HashSet::new();
+        let mut queue = VecDeque::new();
+
+        queued.insert(root_binary_name.to_string());
+        queue.push_back(root_binary_name.to_string());
+
+        while let Some(binary_name) = queue.pop_front() {
+            let class_id = self.load_class(&binary_name, memory)?;
+            loaded_ids.push(class_id);
+
+            for referenced_name in self.available_references(class_id, memory)? {
+                if queued.insert(referenced_name.clone()) {
+                    queue.push_back(referenced_name);
+                }
+            }
+        }
+
+        Ok(loaded_ids)
+    }
+
+    fn available_references(
+        &self,
+        class_id: ClassId,
+        memory: &VirtualMemory,
+    ) -> Result<Vec<String>, VmError> {
+        let class = memory
+            .method_area
+            .class(class_id)
+            .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", class_id)))?;
+        let mut names = HashSet::new();
+
+        names.extend(class.class_refs.values().cloned());
+        names.extend(
+            class
+                .field_refs
+                .values()
+                .map(|field_ref| field_ref.class_name.clone()),
+        );
+        names.extend(
+            class
+                .method_refs
+                .values()
+                .map(|method_ref| method_ref.class_name.clone()),
+        );
+
+        let mut names = names
+            .into_iter()
+            .filter(|name| memory.method_area.class_id(name).is_none())
+            .filter(|name| self.source.has_class(name))
+            .collect::<Vec<_>>();
+        names.sort();
+        Ok(names)
     }
 }
 
