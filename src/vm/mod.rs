@@ -6,6 +6,7 @@ pub mod error;
 pub mod frame;
 pub mod ids;
 pub mod instruction;
+pub mod loader;
 pub mod memory;
 pub mod thread;
 pub mod value;

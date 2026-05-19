@@ -6,6 +6,7 @@ use crate::{
         error::{UnsupportedFeature, VmError},
         frame::Frame,
         ids::ClassId,
+        loader::{ClassLoader, ClassSource},
         memory::{Array, VirtualMemory},
         value::Value,
     },
@@ -35,6 +36,14 @@ impl Vm {
             .into_iter()
             .map(|class_file| self.load_class_file(class_file))
             .collect()
+    }
+
+    pub fn load_class_from_source<S: ClassSource>(
+        &mut self,
+        loader: &mut ClassLoader<S>,
+        binary_name: &str,
+    ) -> Result<ClassId, VmError> {
+        loader.load_class(binary_name, &mut self.memory)
     }
 
     pub fn invoke_static(
