@@ -8,8 +8,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Rust stable / JDK ${{ matrix.java-version }} / release ${{ matrix.java-release || 'default' }}
+  compile-java-fixtures:
+    name: Compile Java fixtures / JDK ${{ matrix.java-version }} / release ${{ matrix.java-release || 'default' }}
     runs-on: ubuntu-latest
 
     strategy:
@@ -37,29 +37,53 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java-version }}
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Show tool versions
         run: |
-          rustc --version
-          cargo --version
           javac -version
 
       - name: Compile Java fixtures
         env:
           JAVA_RELEASE: ${{ matrix.java-release }}
         run: |
-          mkdir -p target/e2e-java-classes
+          mkdir -p target/e2e-java-classes/${{ matrix.java-version }}-${{ matrix.java-release || 'default' }}
           if [ -n "$JAVA_RELEASE" ]; then
-            javac --release "$JAVA_RELEASE" -d target/e2e-java-classes tests/fixtures/java/*.java
+            javac --release "$JAVA_RELEASE" -d target/e2e-java-classes/${{ matrix.java-version }}-${{ matrix.java-release || 'default' }} tests/fixtures/java/*.java
           else
-            javac -d target/e2e-java-classes tests/fixtures/java/*.java
+            javac -d target/e2e-java-classes/${{ matrix.java-version }}-${{ matrix.java-release || 'default' }} tests/fixtures/java/*.java
           fi
           find target/e2e-java-classes -name '*.class' -print | sort
 
+      - name: Upload Java fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-classes-${{ matrix.java-version }}-${{ matrix.java-release || 'default' }}
+          path: target/e2e-java-classes/${{ matrix.java-version }}-${{ matrix.java-release || 'default' }}
+
+  test:
+    name: Rust stable / all Java fixtures
+    runs-on: ubuntu-latest
+    needs: compile-java-fixtures
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download Java fixtures
+        uses: actions/download-artifact@v4
+        with:
+          pattern: java-classes-*
+          path: target/e2e-java-fixtures
+
+      - name: Show tool versions
+        run: |
+          rustc --version
+          cargo --version
+          find target/e2e-java-fixtures -name '*.class' -print | sort
+
       - name: Test Rust parser
         env:
-          RUST_JVM_E2E_JAVA_RELEASE: ${{ matrix.java-release }}
-          RUST_JVM_E2E_CLASSES_DIR: target/e2e-java-classes
+          RUST_JVM_E2E_CLASSES_ROOT: target/e2e-java-fixtures
         run: cargo test --all-targets

@@ -17,13 +17,20 @@ struct CompiledClass {
   dir: PathBuf,
 }
 
-fn load_fixture_class(class_name: &str) -> Option<CompiledClass> {
-  if let Some(dir) = precompiled_classes_dir() {
-    let class_path = class_file_path(&dir, class_name);
-    return Some(CompiledClass {
-      bytes: fs::read(class_path).expect("failed to read precompiled class fixture"),
-      dir,
-    });
+fn load_fixture_classes(class_name: &str) -> Option<Vec<CompiledClass>> {
+  if let Some(dirs) = precompiled_classes_dirs() {
+    return Some(
+      dirs
+        .into_iter()
+        .map(|dir| {
+          let class_path = class_file_path(&dir, class_name);
+          CompiledClass {
+            bytes: fs::read(class_path).expect("failed to read precompiled class fixture"),
+            dir,
+          }
+        })
+        .collect(),
+    );
   }
 
   let millis = SystemTime::now()
@@ -70,17 +77,32 @@ fn load_fixture_class(class_name: &str) -> Option<CompiledClass> {
   }
 
   let class_path = class_file_path(&dir, class_name);
-  Some(CompiledClass {
+  Some(vec![CompiledClass {
     bytes: fs::read(class_path).expect("failed to read compiled class file"),
     dir,
-  })
+  }])
 }
 
-fn precompiled_classes_dir() -> Option<PathBuf> {
-  std::env::var("RUST_JVM_E2E_CLASSES_DIR")
+fn precompiled_classes_dirs() -> Option<Vec<PathBuf>> {
+  if let Some(root) = std::env::var("RUST_JVM_E2E_CLASSES_ROOT")
     .ok()
     .filter(|dir| !dir.trim().is_empty())
     .map(PathBuf::from)
+  {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(root)
+      .expect("failed to read precompiled class fixture root")
+      .map(|entry| entry.expect("failed to read fixture root entry").path())
+      .filter(|path| path.is_dir())
+      .collect();
+    dirs.sort();
+    assert!(!dirs.is_empty(), "precompiled fixture root must contain class directories");
+    return Some(dirs);
+  }
+
+  std::env::var("RUST_JVM_E2E_CLASSES_DIR")
+    .ok()
+    .filter(|dir| !dir.trim().is_empty())
+    .map(|dir| vec![PathBuf::from(dir)])
 }
 
 fn java_release() -> Option<String> {
@@ -153,140 +175,137 @@ fn method_code_names(class_file: &ClassFile, method_name: &str) -> Vec<&'static 
     .expect("method should have a Code attribute")
 }
 
-#[test]
-fn e2e_parse_simple_main_class() {
-  let Some(compiled) = load_fixture_class("SimpleMain") else {
+fn for_each_fixture_class(class_name: &str, mut check: impl FnMut(&CompiledClass)) {
+  let Some(compiled_classes) = load_fixture_classes(class_name) else {
     return;
   };
 
-  let class_file = parse_complete(&compiled.bytes);
+  assert!(!compiled_classes.is_empty(), "at least one fixture class should be available");
+  for compiled in &compiled_classes {
+    check(compiled);
+  }
+}
 
-  assert_eq!(class_file.header.magic, 0xCAFEBABE);
-  assert!(class_file.header.major >= 45);
-  assert!(class_file.methods.methods_count >= 2);
+#[test]
+fn e2e_parse_simple_main_class() {
+  for_each_fixture_class("SimpleMain", |compiled| {
+    let class_file = parse_complete(&compiled.bytes);
+
+    assert_eq!(class_file.header.magic, 0xCAFEBABE);
+    assert!(class_file.header.major >= 45);
+    assert!(class_file.methods.methods_count >= 2);
+  });
 }
 
 #[test]
 fn e2e_parse_constants_switches_and_annotations() {
-  let Some(compiled) = load_fixture_class("EdgeCases") else {
-    return;
-  };
+  for_each_fixture_class("EdgeCases", |compiled| {
+    let class_file = parse_complete(&compiled.bytes);
 
-  let class_file = parse_complete(&compiled.bytes);
-
-  assert!(class_file
-    .constant_pool
-    .constants
-    .iter()
-    .any(|constant| matches!(constant, Constant::Long { .. })));
-  assert!(class_file
-    .constant_pool
-    .constants
-    .iter()
-    .any(|constant| matches!(constant, Constant::Double { .. })));
-  assert!(method_code_names(&class_file, "denseSwitch").contains(&"tableswitch"));
-  assert!(method_code_names(&class_file, "sparseSwitch").contains(&"lookupswitch"));
-  assert!(class_file.attributes.attributes.iter().any(|attribute| {
-    matches!(attribute, ClassFileAttribute::RuntimeVisibleAnnotations(_))
-  }));
-  assert!(class_file.attributes.attributes.iter().any(|attribute| {
-    matches!(attribute, ClassFileAttribute::RuntimeVisibleTypeAnnotations(_))
-  }));
+    assert!(class_file
+      .constant_pool
+      .constants
+      .iter()
+      .any(|constant| matches!(constant, Constant::Long { .. })));
+    assert!(class_file
+      .constant_pool
+      .constants
+      .iter()
+      .any(|constant| matches!(constant, Constant::Double { .. })));
+    assert!(method_code_names(&class_file, "denseSwitch").contains(&"tableswitch"));
+    assert!(method_code_names(&class_file, "sparseSwitch").contains(&"lookupswitch"));
+    assert!(class_file.attributes.attributes.iter().any(|attribute| {
+      matches!(attribute, ClassFileAttribute::RuntimeVisibleAnnotations(_))
+    }));
+    assert!(class_file.attributes.attributes.iter().any(|attribute| {
+      matches!(attribute, ClassFileAttribute::RuntimeVisibleTypeAnnotations(_))
+    }));
+  });
 }
 
 #[test]
 fn e2e_parse_record_class() {
-  let Some(compiled) = load_fixture_class("Point") else {
-    return;
-  };
+  for_each_fixture_class("Point", |compiled| {
+    let class_file = parse_complete(&compiled.bytes);
 
-  let class_file = parse_complete(&compiled.bytes);
-
-  assert!(class_file
-    .attributes
-    .attributes
-    .iter()
-    .any(|attribute| matches!(attribute, ClassFileAttribute::Record(_))));
+    assert!(class_file
+      .attributes
+      .attributes
+      .iter()
+      .any(|attribute| matches!(attribute, ClassFileAttribute::Record(_))));
+  });
 }
 
 #[test]
 fn e2e_parse_inner_classes_exceptions_and_lambda() {
-  let Some(compiled) = load_fixture_class("AdvancedFeatures") else {
-    return;
-  };
+  for_each_fixture_class("AdvancedFeatures", |compiled| {
+    let class_file = parse_complete(&compiled.bytes);
 
-  let class_file = parse_complete(&compiled.bytes);
+    assert!(class_file
+      .attributes
+      .attributes
+      .iter()
+      .any(|attribute| matches!(attribute, ClassFileAttribute::InnerClasses(_))));
+    assert!(class_file
+      .attributes
+      .attributes
+      .iter()
+      .any(|attribute| matches!(attribute, ClassFileAttribute::BootstrapMethods(_))));
+    assert!(method_code_names(&class_file, "lambda").contains(&"invokedynamic"));
+    assert!(class_file.methods.methods.iter().any(|method| {
+      method.attributes.attributes.iter().any(|attribute| {
+        matches!(attribute, MethodInfoAttribute::Exceptions(_))
+      })
+    }));
 
-  assert!(class_file
-    .attributes
-    .attributes
-    .iter()
-    .any(|attribute| matches!(attribute, ClassFileAttribute::InnerClasses(_))));
-  assert!(class_file
-    .attributes
-    .attributes
-    .iter()
-    .any(|attribute| matches!(attribute, ClassFileAttribute::BootstrapMethods(_))));
-  assert!(method_code_names(&class_file, "lambda").contains(&"invokedynamic"));
-  assert!(class_file.methods.methods.iter().any(|method| {
-    method.attributes.attributes.iter().any(|attribute| {
-      matches!(attribute, MethodInfoAttribute::Exceptions(_))
-    })
-  }));
-
-  let parsed_classes = parse_all_class_files(&compiled.dir);
-  assert!(parsed_classes.len() >= 3);
+    let parsed_classes = parse_all_class_files(&compiled.dir);
+    assert!(parsed_classes.len() >= 3);
+  });
 }
 
 #[test]
 fn e2e_parse_arrays_numeric_ops_and_casts() {
-  let Some(compiled) = load_fixture_class("RuntimeShapes") else {
-    return;
-  };
+  for_each_fixture_class("RuntimeShapes", |compiled| {
+    let class_file = parse_complete(&compiled.bytes);
+    let mix = method_code_names(&class_file, "mix");
+    let arrays = method_code_names(&class_file, "arrays");
 
-  let class_file = parse_complete(&compiled.bytes);
-  let mix = method_code_names(&class_file, "mix");
-  let arrays = method_code_names(&class_file, "arrays");
-
-  assert!(mix.contains(&"lshl"));
-  assert!(mix.contains(&"lxor"));
-  assert!(mix.contains(&"ddiv"));
-  assert!(mix.contains(&"d2l"));
-  assert!(arrays.contains(&"multianewarray"));
-  assert!(arrays.contains(&"instanceof"));
-  assert!(arrays.contains(&"checkcast"));
-  assert!(arrays.contains(&"anewarray"));
+    assert!(mix.contains(&"lshl"));
+    assert!(mix.contains(&"lxor"));
+    assert!(mix.contains(&"ddiv"));
+    assert!(mix.contains(&"d2l"));
+    assert!(arrays.contains(&"multianewarray"));
+    assert!(arrays.contains(&"instanceof"));
+    assert!(arrays.contains(&"checkcast"));
+    assert!(arrays.contains(&"anewarray"));
+  });
 }
 
 #[test]
 fn e2e_parse_interfaces_inheritance_and_generics() {
-  let Some(compiled) = load_fixture_class("GenericChild") else {
-    return;
-  };
+  for_each_fixture_class("GenericChild", |compiled| {
+    let class_file = parse_complete(&compiled.bytes);
 
-  let class_file = parse_complete(&compiled.bytes);
-
-  assert_eq!(class_file.interfaces.interfaces_count, 1);
-  assert!(class_file
-    .attributes
-    .attributes
-    .iter()
-    .any(|attribute| matches!(attribute, ClassFileAttribute::Signature(_))));
-  assert!(method_code_names(&class_file, "label").contains(&"invokespecial"));
-  assert!(parse_all_class_files(&compiled.dir).len() >= 3);
+    assert_eq!(class_file.interfaces.interfaces_count, 1);
+    assert!(class_file
+      .attributes
+      .attributes
+      .iter()
+      .any(|attribute| matches!(attribute, ClassFileAttribute::Signature(_))));
+    assert!(method_code_names(&class_file, "label").contains(&"invokespecial"));
+    assert!(parse_all_class_files(&compiled.dir).len() >= 3);
+  });
 }
 
 #[test]
 fn e2e_parse_sealed_hierarchy_when_supported_by_javac() {
-  let Some(compiled) = load_fixture_class("SealedRoot") else {
-    return;
-  };
+  for_each_fixture_class("SealedRoot", |compiled| {
+    let class_file = parse_complete(&compiled.bytes);
 
-  let class_file = parse_complete(&compiled.bytes);
-
-  assert!(class_file
-    .attributes
-    .attributes
-    .iter()
-    .any(|attribute| matches!(attribute, ClassFileAttribute::PermittedSubclasses(_))));
+    assert!(class_file
+      .attributes
+      .attributes
+      .iter()
+      .any(|attribute| matches!(attribute, ClassFileAttribute::PermittedSubclasses(_))));
+  });
 }
