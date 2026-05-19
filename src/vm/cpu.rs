@@ -1,10 +1,12 @@
+use std::convert::TryFrom;
+
 use crate::vm::{
     class::{RuntimeFieldRef, RuntimeMethodRef},
     error::{UnsupportedFeature, VmError},
     frame::Frame,
     ids::{CpIndex, ObjectRef, ThreadId},
     instruction::{DecodedInstruction, DecodedInstructionKind},
-    memory::{HeapEntry, VirtualMemory},
+    memory::{Array, HeapEntry, VirtualMemory},
     value::Value,
 };
 
@@ -133,6 +135,7 @@ impl VirtualCpu {
                     ))),
                 }
             }
+            DecodedInstructionKind::IALoad => self.int_array_load(memory, instruction),
             DecodedInstructionKind::IStore(index) => {
                 let value = self.pop_int(memory)?;
                 self.set_local(memory, *index, Value::Int(value))?;
@@ -152,6 +155,7 @@ impl VirtualCpu {
                     ))),
                 }
             }
+            DecodedInstructionKind::IAStore => self.int_array_store(memory, instruction),
             DecodedInstructionKind::Dup => {
                 let value = self
                     .current_frame_mut(memory)?
@@ -254,6 +258,8 @@ impl VirtualCpu {
                 self.invoke_special_instruction(memory, instruction, *index)
             }
             DecodedInstructionKind::New(index) => self.new_object(memory, instruction, *index),
+            DecodedInstructionKind::NewArray(atype) => self.new_array(memory, instruction, *atype),
+            DecodedInstructionKind::ArrayLength => self.array_length(memory, instruction),
             DecodedInstructionKind::GetField(index) => self.get_field(memory, instruction, *index),
             DecodedInstructionKind::PutField(index) => self.put_field(memory, instruction, *index),
             DecodedInstructionKind::IReturn => {
@@ -327,6 +333,76 @@ impl VirtualCpu {
         Ok(StepResult::Continue)
     }
 
+    fn int_array_load(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+    ) -> Result<StepResult, VmError> {
+        let index = self.checked_array_index(self.pop_int(memory)?)?;
+        let array_ref = self.require_object_ref(self.pop_ref(memory)?)?;
+        let value = match memory.heap.get(array_ref) {
+            Some(HeapEntry::Array(Array::Int(values))) => *values.get(index).ok_or_else(|| {
+                VmError::RuntimeException("ArrayIndexOutOfBoundsException".to_string())
+            })?,
+            Some(HeapEntry::Array(_)) => {
+                return Err(VmError::VerificationError(
+                    "iaload expected int array".to_string(),
+                ));
+            }
+            Some(_) => {
+                return Err(VmError::VerificationError(
+                    "reference does not point to an array".to_string(),
+                ));
+            }
+            None => {
+                return Err(VmError::RuntimeException(
+                    "invalid array reference".to_string(),
+                ));
+            }
+        };
+
+        self.push(memory, Value::Int(value))?;
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn int_array_store(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+    ) -> Result<StepResult, VmError> {
+        let value = self.pop_int(memory)?;
+        let index = self.checked_array_index(self.pop_int(memory)?)?;
+        let array_ref = self.require_object_ref(self.pop_ref(memory)?)?;
+
+        match memory.heap.get_mut(array_ref) {
+            Some(HeapEntry::Array(Array::Int(values))) => {
+                let slot = values.get_mut(index).ok_or_else(|| {
+                    VmError::RuntimeException("ArrayIndexOutOfBoundsException".to_string())
+                })?;
+                *slot = value;
+            }
+            Some(HeapEntry::Array(_)) => {
+                return Err(VmError::VerificationError(
+                    "iastore expected int array".to_string(),
+                ));
+            }
+            Some(_) => {
+                return Err(VmError::VerificationError(
+                    "reference does not point to an array".to_string(),
+                ));
+            }
+            None => {
+                return Err(VmError::RuntimeException(
+                    "invalid array reference".to_string(),
+                ));
+            }
+        }
+
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
     fn new_object(
         &self,
         memory: &mut VirtualMemory,
@@ -345,6 +421,65 @@ impl VirtualCpu {
             .default_instance_fields();
         let reference = memory.heap.allocate_object(class_id, fields);
         self.push(memory, Value::Ref(Some(reference)))?;
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn new_array(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        atype: u8,
+    ) -> Result<StepResult, VmError> {
+        let count = self.pop_int(memory)?;
+        if count < 0 {
+            return Err(VmError::RuntimeException(
+                "NegativeArraySizeException".to_string(),
+            ));
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| VmError::RuntimeException("NegativeArraySizeException".to_string()))?;
+
+        let array = match atype {
+            10 => Array::Int(vec![0; count]),
+            _ => {
+                return Err(VmError::UnsupportedFeature(UnsupportedFeature::Opcode {
+                    opcode: instruction.opcode,
+                    mnemonic: "newarray",
+                }));
+            }
+        };
+        let reference = memory.heap.allocate_array(array);
+        self.push(memory, Value::Ref(Some(reference)))?;
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn array_length(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+    ) -> Result<StepResult, VmError> {
+        let array_ref = self.require_object_ref(self.pop_ref(memory)?)?;
+        let length = match memory.heap.get(array_ref) {
+            Some(HeapEntry::Array(Array::Int(values))) => values.len(),
+            Some(HeapEntry::Array(Array::Ref(values))) => values.len(),
+            Some(HeapEntry::Array(Array::Values(values))) => values.len(),
+            Some(_) => {
+                return Err(VmError::VerificationError(
+                    "reference does not point to an array".to_string(),
+                ));
+            }
+            None => {
+                return Err(VmError::RuntimeException(
+                    "invalid array reference".to_string(),
+                ));
+            }
+        };
+        let length = i32::try_from(length).map_err(|_| {
+            VmError::InternalError("array length does not fit into int".to_string())
+        })?;
+        self.push(memory, Value::Int(length))?;
         self.set_pc(memory, instruction.next_pc)?;
         Ok(StepResult::Continue)
     }
@@ -742,6 +877,16 @@ impl VirtualCpu {
         value.ok_or_else(|| VmError::RuntimeException("NullPointerException".to_string()))
     }
 
+    fn checked_array_index(&self, index: i32) -> Result<usize, VmError> {
+        if index < 0 {
+            return Err(VmError::RuntimeException(
+                "ArrayIndexOutOfBoundsException".to_string(),
+            ));
+        }
+        usize::try_from(index)
+            .map_err(|_| VmError::RuntimeException("ArrayIndexOutOfBoundsException".to_string()))
+    }
+
     fn pop_int(&self, memory: &mut VirtualMemory) -> Result<i32, VmError> {
         match self.pop_value(memory)? {
             Value::Int(value) => Ok(value),
@@ -823,6 +968,8 @@ impl MnemonicFallback for DecodedInstructionKind {
             DecodedInstructionKind::Ldc(_) => "ldc",
             DecodedInstructionKind::ALoad(_) => "aload",
             DecodedInstructionKind::AStore(_) => "astore",
+            DecodedInstructionKind::IALoad => "iaload",
+            DecodedInstructionKind::IAStore => "iastore",
             DecodedInstructionKind::Dup => "dup",
             DecodedInstructionKind::IfICmpEq(_) => "if_icmpeq",
             DecodedInstructionKind::IfICmpNe(_) => "if_icmpne",
@@ -834,6 +981,8 @@ impl MnemonicFallback for DecodedInstructionKind {
             DecodedInstructionKind::InvokeStatic(_) => "invokestatic",
             DecodedInstructionKind::InvokeSpecial(_) => "invokespecial",
             DecodedInstructionKind::New(_) => "new",
+            DecodedInstructionKind::NewArray(_) => "newarray",
+            DecodedInstructionKind::ArrayLength => "arraylength",
             DecodedInstructionKind::GetField(_) => "getfield",
             DecodedInstructionKind::PutField(_) => "putfield",
             DecodedInstructionKind::AReturn => "areturn",
