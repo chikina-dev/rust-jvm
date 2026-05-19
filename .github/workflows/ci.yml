@@ -46,7 +46,20 @@ jobs:
           cargo --version
           javac -version
 
-      - name: Test
+      - name: Compile Java fixtures
+        env:
+          JAVA_RELEASE: ${{ matrix.java-release }}
+        run: |
+          mkdir -p target/e2e-java-classes
+          if [ -n "$JAVA_RELEASE" ]; then
+            javac --release "$JAVA_RELEASE" -d target/e2e-java-classes tests/fixtures/java/*.java
+          else
+            javac -d target/e2e-java-classes tests/fixtures/java/*.java
+          fi
+          find target/e2e-java-classes -name '*.class' -print | sort
+
+      - name: Test Rust parser
         env:
           RUST_JVM_E2E_JAVA_RELEASE: ${{ matrix.java-release }}
+          RUST_JVM_E2E_CLASSES_DIR: target/e2e-java-classes
         run: cargo test --all-targets

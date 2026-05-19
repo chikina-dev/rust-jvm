@@ -17,7 +17,15 @@ struct CompiledClass {
   dir: PathBuf,
 }
 
-fn compile_java(class_name: &str, source: &str) -> Option<CompiledClass> {
+fn load_fixture_class(class_name: &str) -> Option<CompiledClass> {
+  if let Some(dir) = precompiled_classes_dir() {
+    let class_path = class_file_path(&dir, class_name);
+    return Some(CompiledClass {
+      bytes: fs::read(class_path).expect("failed to read precompiled class fixture"),
+      dir,
+    });
+  }
+
   let millis = SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .expect("system time should be after unix epoch")
@@ -30,8 +38,7 @@ fn compile_java(class_name: &str, source: &str) -> Option<CompiledClass> {
   ));
   fs::create_dir_all(&dir).expect("failed to create javac temp dir");
 
-  let source_path = dir.join(format!("{class_name}.java"));
-  fs::write(&source_path, source).expect("failed to write java source");
+  let source_path = fixture_source_path(class_name);
 
   let mut command = Command::new("javac");
   if let Some(release) = java_release() {
@@ -69,10 +76,25 @@ fn compile_java(class_name: &str, source: &str) -> Option<CompiledClass> {
   })
 }
 
+fn precompiled_classes_dir() -> Option<PathBuf> {
+  std::env::var("RUST_JVM_E2E_CLASSES_DIR")
+    .ok()
+    .filter(|dir| !dir.trim().is_empty())
+    .map(PathBuf::from)
+}
+
 fn java_release() -> Option<String> {
   std::env::var("RUST_JVM_E2E_JAVA_RELEASE")
     .ok()
     .filter(|release| !release.trim().is_empty())
+}
+
+fn fixture_source_path(class_name: &str) -> PathBuf {
+  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("tests")
+    .join("fixtures")
+    .join("java")
+    .join(format!("{class_name}.java"))
 }
 
 fn class_file_path(dir: &PathBuf, class_name: &str) -> PathBuf {
@@ -133,16 +155,7 @@ fn method_code_names(class_file: &ClassFile, method_name: &str) -> Vec<&'static 
 
 #[test]
 fn e2e_parse_simple_main_class() {
-  let Some(compiled) = compile_java(
-    "SimpleMain",
-    r#"
-public class SimpleMain {
-  public static void main(String[] args) {
-    System.out.println("hello");
-  }
-}
-"#,
-  ) else {
+  let Some(compiled) = load_fixture_class("SimpleMain") else {
     return;
   };
 
@@ -155,59 +168,7 @@ public class SimpleMain {
 
 #[test]
 fn e2e_parse_constants_switches_and_annotations() {
-  let Some(compiled) = compile_java(
-    "EdgeCases",
-    r#"
-import java.lang.annotation.ElementType;
-import java.lang.annotation.Retention;
-import java.lang.annotation.RetentionPolicy;
-import java.lang.annotation.Target;
-
-@Retention(RetentionPolicy.RUNTIME)
-@Target({ElementType.TYPE, ElementType.TYPE_USE, ElementType.TYPE_PARAMETER, ElementType.METHOD, ElementType.PARAMETER})
-@interface Marker {
-  int value();
-  Class<?> type();
-  String name() default "ok";
-}
-
-@Marker(value = 7, type = String.class)
-public class EdgeCases<@Marker(value = 1, type = Object.class) T> {
-  static final long L = 1234567890123L;
-  static final double D = 1.25d;
-
-  public static int denseSwitch(int x) {
-    switch (x) {
-      case 0:
-        return 10;
-      case 1:
-        return 11;
-      case 2:
-        return 12;
-      default:
-        return -1;
-    }
-  }
-
-  public static int sparseSwitch(int x) {
-    switch (x) {
-      case 1:
-        return 10;
-      case 100:
-        return 20;
-      case 1000:
-        return 30;
-      default:
-        return -1;
-    }
-  }
-
-  public @Marker(value = 2, type = String.class) String typeUse(@Marker(value = 3, type = String.class) String input) {
-    return input;
-  }
-}
-"#,
-  ) else {
+  let Some(compiled) = load_fixture_class("EdgeCases") else {
     return;
   };
 
@@ -235,16 +196,7 @@ public class EdgeCases<@Marker(value = 1, type = Object.class) T> {
 
 #[test]
 fn e2e_parse_record_class() {
-  let Some(compiled) = compile_java(
-    "Point",
-    r#"
-public record Point(int x, int y) {
-  public int sum() {
-    return x + y;
-  }
-}
-"#,
-  ) else {
+  let Some(compiled) = load_fixture_class("Point") else {
     return;
   };
 
@@ -259,42 +211,7 @@ public record Point(int x, int y) {
 
 #[test]
 fn e2e_parse_inner_classes_exceptions_and_lambda() {
-  let Some(compiled) = compile_java(
-    "AdvancedFeatures",
-    r#"
-import java.io.IOException;
-import java.util.function.Supplier;
-
-public class AdvancedFeatures implements Runnable {
-  enum Mode {
-    ON,
-    OFF
-  }
-
-  static class Box {
-    int value;
-  }
-
-  public void run() {
-    try {
-      mayThrow();
-    } catch (IOException error) {
-      throw new RuntimeException(error);
-    } finally {
-      int ignored = 1;
-    }
-  }
-
-  public static String lambda() {
-    Supplier<String> supplier = () -> "ok";
-    return supplier.get();
-  }
-
-  static void mayThrow() throws IOException {
-  }
-}
-"#,
-  ) else {
+  let Some(compiled) = load_fixture_class("AdvancedFeatures") else {
     return;
   };
 
@@ -323,26 +240,7 @@ public class AdvancedFeatures implements Runnable {
 
 #[test]
 fn e2e_parse_arrays_numeric_ops_and_casts() {
-  let Some(compiled) = compile_java(
-    "RuntimeShapes",
-    r#"
-public class RuntimeShapes {
-  public static long mix(int seed) {
-    long value = seed;
-    value = (value << 3) ^ 0xCAFE_BABEL;
-    double d = value / 3.0d;
-    return value + (long) d;
-  }
-
-  public static int arrays(Object input) {
-    int[][] grid = new int[2][3];
-    grid[1][2] = input instanceof String ? ((String) input).length() : 5;
-    Object[] refs = new String[] {"a", "bb"};
-    return grid[1][2] + refs.length;
-  }
-}
-"#,
-  ) else {
+  let Some(compiled) = load_fixture_class("RuntimeShapes") else {
     return;
   };
 
@@ -362,30 +260,7 @@ public class RuntimeShapes {
 
 #[test]
 fn e2e_parse_interfaces_inheritance_and_generics() {
-  let Some(compiled) = compile_java(
-    "GenericChild",
-    r#"
-interface Named {
-  default String label() {
-    return "named";
-  }
-}
-
-abstract class GenericBase<T extends Number> {
-  abstract T value();
-}
-
-public class GenericChild extends GenericBase<Integer> implements Named {
-  public Integer value() {
-    return 42;
-  }
-
-  public String label() {
-    return Named.super.label() + value();
-  }
-}
-"#,
-  ) else {
+  let Some(compiled) = load_fixture_class("GenericChild") else {
     return;
   };
 
@@ -403,16 +278,7 @@ public class GenericChild extends GenericBase<Integer> implements Named {
 
 #[test]
 fn e2e_parse_sealed_hierarchy_when_supported_by_javac() {
-  let Some(compiled) = compile_java(
-    "SealedRoot",
-    r#"
-public sealed interface SealedRoot permits SealedLeaf {
-}
-
-final class SealedLeaf implements SealedRoot {
-}
-"#,
-  ) else {
+  let Some(compiled) = load_fixture_class("SealedRoot") else {
     return;
   };
 
