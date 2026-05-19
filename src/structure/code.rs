@@ -937,7 +937,7 @@ pub static CODE_BYTES: phf::Map<u8, CodeByte> = phf_map! {
   0x84u8 => CodeByte {
     name: "iinc",
     opcode: 0x84,
-    length: 0x01,
+    length: 0x03,
     stack_behavior: "No change",
     data: Vec::new()
   },

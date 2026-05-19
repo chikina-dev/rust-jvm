@@ -175,6 +175,37 @@ impl VirtualCpu {
             DecodedInstructionKind::IfLe(offset) => {
                 self.branch_if(memory, instruction, *offset, |value| value <= 0)
             }
+            DecodedInstructionKind::IfICmpEq(offset) => {
+                self.branch_if_icmp(memory, instruction, *offset, |lhs, rhs| lhs == rhs)
+            }
+            DecodedInstructionKind::IfICmpNe(offset) => {
+                self.branch_if_icmp(memory, instruction, *offset, |lhs, rhs| lhs != rhs)
+            }
+            DecodedInstructionKind::IfICmpLt(offset) => {
+                self.branch_if_icmp(memory, instruction, *offset, |lhs, rhs| lhs < rhs)
+            }
+            DecodedInstructionKind::IfICmpGe(offset) => {
+                self.branch_if_icmp(memory, instruction, *offset, |lhs, rhs| lhs >= rhs)
+            }
+            DecodedInstructionKind::IfICmpGt(offset) => {
+                self.branch_if_icmp(memory, instruction, *offset, |lhs, rhs| lhs > rhs)
+            }
+            DecodedInstructionKind::IfICmpLe(offset) => {
+                self.branch_if_icmp(memory, instruction, *offset, |lhs, rhs| lhs <= rhs)
+            }
+            DecodedInstructionKind::IInc { index, value } => {
+                let current = match self.local(memory, *index)? {
+                    Value::Int(value) => value,
+                    value => {
+                        return Err(VmError::VerificationError(format!(
+                            "expected int in local {index}, found {value:?}"
+                        )));
+                    }
+                };
+                self.set_local(memory, *index, Value::Int(current + *value as i32))?;
+                self.set_pc(memory, instruction.next_pc)?;
+                Ok(StepResult::Continue)
+            }
             DecodedInstructionKind::IReturn => {
                 let value = Value::Int(self.pop_int(memory)?);
                 self.return_from_frame(memory, Some(value))
@@ -218,6 +249,23 @@ impl VirtualCpu {
     ) -> Result<StepResult, VmError> {
         let value = self.pop_int(memory)?;
         if predicate(value) {
+            self.set_branch_pc(memory, instruction.pc, offset)?;
+        } else {
+            self.set_pc(memory, instruction.next_pc)?;
+        }
+        Ok(StepResult::Continue)
+    }
+
+    fn branch_if_icmp(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        offset: i16,
+        predicate: impl FnOnce(i32, i32) -> bool,
+    ) -> Result<StepResult, VmError> {
+        let rhs = self.pop_int(memory)?;
+        let lhs = self.pop_int(memory)?;
+        if predicate(lhs, rhs) {
             self.set_branch_pc(memory, instruction.pc, offset)?;
         } else {
             self.set_pc(memory, instruction.next_pc)?;
