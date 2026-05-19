@@ -6,7 +6,7 @@ use crate::{
         error::{UnsupportedFeature, VmError},
         frame::Frame,
         ids::ClassId,
-        memory::VirtualMemory,
+        memory::{Array, VirtualMemory},
         value::Value,
     },
 };
@@ -25,6 +25,16 @@ impl Vm {
         let id = ClassId(self.memory.method_area.classes.len());
         let runtime_class = RuntimeClass::from_class_file(id, class_file)?;
         Ok(self.memory.method_area.insert_class(runtime_class))
+    }
+
+    pub fn load_class_files<'a>(
+        &mut self,
+        class_files: impl IntoIterator<Item = &'a ClassFile>,
+    ) -> Result<Vec<ClassId>, VmError> {
+        class_files
+            .into_iter()
+            .map(|class_file| self.load_class_file(class_file))
+            .collect()
     }
 
     pub fn invoke_static(
@@ -80,5 +90,18 @@ impl Vm {
 
         let mut cpu = VirtualCpu::new(thread_id);
         cpu.run_until_return(&mut self.memory)
+    }
+
+    pub fn invoke_public_static_main(
+        &mut self,
+        class_name: &str,
+    ) -> Result<Option<Value>, VmError> {
+        let args_ref = self.memory.heap.allocate_array(Array::Ref(Vec::new()));
+        self.invoke_static(
+            class_name,
+            "main",
+            "([Ljava/lang/String;)V",
+            vec![Value::Ref(Some(args_ref))],
+        )
     }
 }

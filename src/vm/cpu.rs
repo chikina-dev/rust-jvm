@@ -101,6 +101,11 @@ impl VirtualCpu {
                 self.set_pc(memory, instruction.next_pc)?;
                 Ok(StepResult::Continue)
             }
+            DecodedInstructionKind::AConstNull => {
+                self.push(memory, Value::null())?;
+                self.set_pc(memory, instruction.next_pc)?;
+                Ok(StepResult::Continue)
+            }
             DecodedInstructionKind::IConst(value) => {
                 self.push(memory, Value::Int(*value))?;
                 self.set_pc(memory, instruction.next_pc)?;
@@ -136,6 +141,7 @@ impl VirtualCpu {
                     ))),
                 }
             }
+            DecodedInstructionKind::AALoad => self.ref_array_load(memory, instruction),
             DecodedInstructionKind::IALoad => self.int_array_load(memory, instruction),
             DecodedInstructionKind::IStore(index) => {
                 let value = self.pop_int(memory)?;
@@ -156,6 +162,7 @@ impl VirtualCpu {
                     ))),
                 }
             }
+            DecodedInstructionKind::AAStore => self.ref_array_store(memory, instruction),
             DecodedInstructionKind::IAStore => self.int_array_store(memory, instruction),
             DecodedInstructionKind::Dup => {
                 let value = self
@@ -262,6 +269,9 @@ impl VirtualCpu {
                 self.invoke_virtual_instruction(memory, instruction, *index)
             }
             DecodedInstructionKind::New(index) => self.new_object(memory, instruction, *index),
+            DecodedInstructionKind::ANewArray(index) => {
+                self.new_ref_array(memory, instruction, *index)
+            }
             DecodedInstructionKind::NewArray(atype) => self.new_array(memory, instruction, *atype),
             DecodedInstructionKind::ArrayLength => self.array_length(memory, instruction),
             DecodedInstructionKind::GetStatic(index) => {
@@ -287,10 +297,6 @@ impl VirtualCpu {
             DecodedInstructionKind::Unknown { opcode } => Err(VmError::VerificationError(format!(
                 "unknown opcode 0x{opcode:02x}"
             ))),
-            other => Err(VmError::UnsupportedFeature(UnsupportedFeature::Opcode {
-                opcode: instruction.opcode,
-                mnemonic: other.mnemonic_fallback(),
-            })),
         }
     }
 
@@ -394,6 +400,39 @@ impl VirtualCpu {
         Ok(StepResult::Continue)
     }
 
+    fn ref_array_load(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+    ) -> Result<StepResult, VmError> {
+        let index = self.checked_array_index(self.pop_int(memory)?)?;
+        let array_ref = self.require_object_ref(self.pop_ref(memory)?)?;
+        let value = match memory.heap.get(array_ref) {
+            Some(HeapEntry::Array(Array::Ref(values))) => *values.get(index).ok_or_else(|| {
+                VmError::RuntimeException("ArrayIndexOutOfBoundsException".to_string())
+            })?,
+            Some(HeapEntry::Array(_)) => {
+                return Err(VmError::VerificationError(
+                    "aaload expected reference array".to_string(),
+                ));
+            }
+            Some(_) => {
+                return Err(VmError::VerificationError(
+                    "reference does not point to an array".to_string(),
+                ));
+            }
+            None => {
+                return Err(VmError::RuntimeException(
+                    "invalid array reference".to_string(),
+                ));
+            }
+        };
+
+        self.push(memory, Value::Ref(value))?;
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
     fn int_array_store(
         &self,
         memory: &mut VirtualMemory,
@@ -413,6 +452,43 @@ impl VirtualCpu {
             Some(HeapEntry::Array(_)) => {
                 return Err(VmError::VerificationError(
                     "iastore expected int array".to_string(),
+                ));
+            }
+            Some(_) => {
+                return Err(VmError::VerificationError(
+                    "reference does not point to an array".to_string(),
+                ));
+            }
+            None => {
+                return Err(VmError::RuntimeException(
+                    "invalid array reference".to_string(),
+                ));
+            }
+        }
+
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn ref_array_store(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+    ) -> Result<StepResult, VmError> {
+        let value = self.pop_ref(memory)?;
+        let index = self.checked_array_index(self.pop_int(memory)?)?;
+        let array_ref = self.require_object_ref(self.pop_ref(memory)?)?;
+
+        match memory.heap.get_mut(array_ref) {
+            Some(HeapEntry::Array(Array::Ref(values))) => {
+                let slot = values.get_mut(index).ok_or_else(|| {
+                    VmError::RuntimeException("ArrayIndexOutOfBoundsException".to_string())
+                })?;
+                *slot = value;
+            }
+            Some(HeapEntry::Array(_)) => {
+                return Err(VmError::VerificationError(
+                    "aastore expected reference array".to_string(),
                 ));
             }
             Some(_) => {
@@ -478,6 +554,28 @@ impl VirtualCpu {
             }
         };
         let reference = memory.heap.allocate_array(array);
+        self.push(memory, Value::Ref(Some(reference)))?;
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn new_ref_array(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let _component_class_name = self.resolve_class_ref(memory, index)?;
+        let count = self.pop_int(memory)?;
+        if count < 0 {
+            return Err(VmError::RuntimeException(
+                "NegativeArraySizeException".to_string(),
+            ));
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| VmError::RuntimeException("NegativeArraySizeException".to_string()))?;
+
+        let reference = memory.heap.allocate_array(Array::Ref(vec![None; count]));
         self.push(memory, Value::Ref(Some(reference)))?;
         self.set_pc(memory, instruction.next_pc)?;
         Ok(StepResult::Continue)
@@ -1069,41 +1167,6 @@ impl VirtualCpu {
                     self.current_thread
                 ))
             })
-    }
-}
-
-trait MnemonicFallback {
-    fn mnemonic_fallback(&self) -> &'static str;
-}
-
-impl MnemonicFallback for DecodedInstructionKind {
-    fn mnemonic_fallback(&self) -> &'static str {
-        match self {
-            DecodedInstructionKind::Ldc(_) => "ldc",
-            DecodedInstructionKind::ALoad(_) => "aload",
-            DecodedInstructionKind::AStore(_) => "astore",
-            DecodedInstructionKind::IALoad => "iaload",
-            DecodedInstructionKind::IAStore => "iastore",
-            DecodedInstructionKind::Dup => "dup",
-            DecodedInstructionKind::IfICmpEq(_) => "if_icmpeq",
-            DecodedInstructionKind::IfICmpNe(_) => "if_icmpne",
-            DecodedInstructionKind::IfICmpLt(_) => "if_icmplt",
-            DecodedInstructionKind::IfICmpGe(_) => "if_icmpge",
-            DecodedInstructionKind::IfICmpGt(_) => "if_icmpgt",
-            DecodedInstructionKind::IfICmpLe(_) => "if_icmple",
-            DecodedInstructionKind::IInc { .. } => "iinc",
-            DecodedInstructionKind::InvokeStatic(_) => "invokestatic",
-            DecodedInstructionKind::InvokeSpecial(_) => "invokespecial",
-            DecodedInstructionKind::InvokeVirtual(_) => "invokevirtual",
-            DecodedInstructionKind::New(_) => "new",
-            DecodedInstructionKind::NewArray(_) => "newarray",
-            DecodedInstructionKind::ArrayLength => "arraylength",
-            DecodedInstructionKind::GetStatic(_) => "getstatic",
-            DecodedInstructionKind::GetField(_) => "getfield",
-            DecodedInstructionKind::PutField(_) => "putfield",
-            DecodedInstructionKind::AReturn => "areturn",
-            _ => "unsupported",
-        }
     }
 }
 

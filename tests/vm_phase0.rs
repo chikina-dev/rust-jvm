@@ -115,6 +115,9 @@ fn decodes_supported_instructions_with_byte_offsets() {
         code_byte("bipush", 0x10, &[0xfb]),
         code_byte("istore_1", 0x3c, &[]),
         code_byte("iload_1", 0x1b, &[]),
+        code_byte("anewarray", 0xbd, &[0x00, 0x02]),
+        code_byte("aastore", 0x53, &[]),
+        code_byte("aaload", 0x32, &[]),
         code_byte("ireturn", 0xac, &[]),
     ])
     .expect("code should decode");
@@ -128,7 +131,14 @@ fn decodes_supported_instructions_with_byte_offsets() {
     assert_eq!(decoded[2].pc, 3);
     assert_eq!(decoded[2].kind, DecodedInstructionKind::IStore(1));
     assert_eq!(decoded[4].pc, 5);
-    assert_eq!(decoded[4].kind, DecodedInstructionKind::IReturn);
+    assert_eq!(
+        decoded[4].kind,
+        DecodedInstructionKind::ANewArray(CpIndex(2))
+    );
+    assert_eq!(decoded[5].kind, DecodedInstructionKind::AAStore);
+    assert_eq!(decoded[6].kind, DecodedInstructionKind::AALoad);
+    assert_eq!(decoded[7].pc, 10);
+    assert_eq!(decoded[7].kind, DecodedInstructionKind::IReturn);
 }
 
 #[test]
