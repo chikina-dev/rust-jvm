@@ -98,6 +98,9 @@ impl Vm {
             .push_frame(frame);
 
         let mut cpu = VirtualCpu::new(thread_id);
+        if method_name != "<clinit>" {
+            cpu.ensure_class_initialized(&mut self.memory, class_id)?;
+        }
         cpu.run_until_return(&mut self.memory)
     }
 

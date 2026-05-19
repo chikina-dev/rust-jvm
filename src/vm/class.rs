@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::{
-    structure::class::{ClassFile, Constant, Field, Method, MethodInfoAttribute},
+    structure::class::{
+        ClassFile, Constant, Field, FieldInfoAttribute, Method, MethodInfoAttribute,
+    },
     vm::{
         constant::ConstantPoolExt,
         descriptor::{JavaType, MethodDescriptor, parse_field_descriptor, parse_method_descriptor},
@@ -21,11 +23,12 @@ pub enum ClassState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeClass {
     pub id: ClassId,
     pub name: String,
     pub fields: Vec<RuntimeField>,
+    pub static_fields: Vec<Value>,
     pub class_refs: HashMap<CpIndex, String>,
     pub field_refs: HashMap<CpIndex, RuntimeFieldRef>,
     pub methods: Vec<RuntimeMethod>,
@@ -46,6 +49,10 @@ impl RuntimeClass {
             .enumerate()
             .map(|(index, field)| RuntimeField::from_field(FieldId(index), class_file, field))
             .collect::<Result<Vec<_>, _>>()?;
+        let static_fields = fields
+            .iter()
+            .map(RuntimeField::static_initial_value)
+            .collect();
         let methods = class_file
             .methods
             .methods
@@ -62,6 +69,7 @@ impl RuntimeClass {
             id,
             name,
             fields,
+            static_fields,
             class_refs,
             field_refs,
             methods,
@@ -86,6 +94,7 @@ impl RuntimeClass {
     pub fn default_instance_fields(&self) -> Vec<Value> {
         self.fields
             .iter()
+            .filter(|field| !field.is_static())
             .map(|field| default_value(&field.descriptor))
             .collect()
     }
@@ -105,13 +114,14 @@ pub struct RuntimeMethodRef {
     pub descriptor: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeField {
     pub id: FieldId,
     pub name: String,
     pub descriptor_source: String,
     pub descriptor: JavaType,
     pub access_flags: u16,
+    pub constant_value: Option<Value>,
 }
 
 impl RuntimeField {
@@ -121,6 +131,7 @@ impl RuntimeField {
             .constant_pool
             .utf8(CpIndex(field.descriptor_index))?;
         let descriptor = parse_field_descriptor(&descriptor_source)?;
+        let constant_value = field_constant_value(class_file, field, &descriptor)?;
 
         Ok(Self {
             id,
@@ -128,7 +139,22 @@ impl RuntimeField {
             descriptor_source,
             descriptor,
             access_flags: field.access_flags,
+            constant_value,
         })
+    }
+
+    pub fn is_static(&self) -> bool {
+        self.access_flags & 0x0008 != 0
+    }
+
+    fn static_initial_value(&self) -> Value {
+        if self.is_static() {
+            self.constant_value
+                .clone()
+                .unwrap_or_else(|| default_value(&self.descriptor))
+        } else {
+            Value::null()
+        }
     }
 }
 
@@ -174,6 +200,78 @@ impl RuntimeMethod {
             max_locals,
             code: decoded_code,
         })
+    }
+}
+
+fn field_constant_value(
+    class_file: &ClassFile,
+    field: &Field,
+    descriptor: &JavaType,
+) -> Result<Option<Value>, VmError> {
+    for attribute in &field.attributes.attributes {
+        if let FieldInfoAttribute::ConstantValue(constant_value) = attribute {
+            let index = CpIndex(constant_value.constant_value_index);
+            return constant_to_value(class_file, index, descriptor).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn constant_to_value(
+    class_file: &ClassFile,
+    index: CpIndex,
+    descriptor: &JavaType,
+) -> Result<Value, VmError> {
+    let constant = class_file
+        .constant_pool
+        .constants
+        .get(index.0.checked_sub(1).ok_or(
+            crate::vm::error::ParseError::InvalidConstantPoolIndex(index.0),
+        )? as usize)
+        .ok_or(crate::vm::error::ParseError::InvalidConstantPoolIndex(
+            index.0,
+        ))?;
+
+    match (descriptor, constant) {
+        (
+            JavaType::Byte | JavaType::Char | JavaType::Int | JavaType::Short | JavaType::Boolean,
+            Constant::Integer { bytes },
+        ) => Ok(Value::Int(*bytes as i32)),
+        (
+            JavaType::Long,
+            Constant::Long {
+                high_bytes,
+                low_bytes,
+            },
+        ) => {
+            let bits = ((*high_bytes as u64) << 32) | *low_bytes as u64;
+            Ok(Value::Long(bits as i64))
+        }
+        (JavaType::Float, Constant::Float { bytes }) => Ok(Value::Float(f32::from_bits(*bytes))),
+        (
+            JavaType::Double,
+            Constant::Double {
+                high_bytes,
+                low_bytes,
+            },
+        ) => {
+            let bits = ((*high_bytes as u64) << 32) | *low_bytes as u64;
+            Ok(Value::Double(f64::from_bits(bits)))
+        }
+        (JavaType::Object(class_name), Constant::String { string_index })
+            if class_name == "java/lang/String" =>
+        {
+            class_file
+                .constant_pool
+                .utf8(CpIndex(*string_index))
+                .map(Value::String)
+                .map_err(Into::into)
+        }
+        _ => Err(VmError::ConstantResolution {
+            index,
+            reason: "ConstantValue type does not match field descriptor".to_string(),
+        }),
     }
 }
 

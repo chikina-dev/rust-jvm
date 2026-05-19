@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 
 use crate::vm::{
-    class::{RuntimeFieldRef, RuntimeMethodRef},
+    class::{ClassState, RuntimeFieldRef, RuntimeMethodRef},
     error::{UnsupportedFeature, VmError},
     frame::Frame,
     ids::{CpIndex, ObjectRef, ThreadId},
@@ -277,6 +277,9 @@ impl VirtualCpu {
             DecodedInstructionKind::GetStatic(index) => {
                 self.get_static(memory, instruction, *index)
             }
+            DecodedInstructionKind::PutStatic(index) => {
+                self.put_static(memory, instruction, *index)
+            }
             DecodedInstructionKind::GetField(index) => self.get_field(memory, instruction, *index),
             DecodedInstructionKind::PutField(index) => self.put_field(memory, instruction, *index),
             DecodedInstructionKind::IReturn => {
@@ -518,6 +521,9 @@ impl VirtualCpu {
             .method_area
             .class_id(&class_name)
             .ok_or_else(|| VmError::ClassNotFound(class_name.clone()))?;
+        if self.ensure_class_initialized(memory, class_id)? {
+            return Ok(StepResult::Continue);
+        }
         let fields = memory
             .method_area
             .class(class_id)
@@ -621,6 +627,9 @@ impl VirtualCpu {
             .method_area
             .class_id(&method_ref.class_name)
             .ok_or_else(|| VmError::ClassNotFound(method_ref.class_name.clone()))?;
+        if method_ref.name != "<clinit>" && self.ensure_class_initialized(memory, class_id)? {
+            return Ok(StepResult::Continue);
+        }
         let (method_id, max_locals, code, parameter_count) = {
             let class = memory
                 .method_area
@@ -896,18 +905,112 @@ impl VirtualCpu {
             ("java/lang/System", "out", "Ljava/io/PrintStream;") => Value::NativeStdout,
             ("java/lang/System", "err", "Ljava/io/PrintStream;") => Value::NativeStderr,
             _ => {
-                return Err(VmError::UnsupportedFeature(
-                    UnsupportedFeature::NativeMethod {
-                        class: field_ref.class_name,
-                        name: field_ref.name,
-                        descriptor: field_ref.descriptor,
-                    },
-                ));
+                let class_id = memory
+                    .method_area
+                    .class_id(&field_ref.class_name)
+                    .ok_or_else(|| VmError::ClassNotFound(field_ref.class_name.clone()))?;
+                if self.ensure_class_initialized(memory, class_id)? {
+                    return Ok(StepResult::Continue);
+                }
+                self.static_field(memory, &field_ref)?.clone()
             }
         };
         self.push(memory, value)?;
         self.set_pc(memory, instruction.next_pc)?;
         Ok(StepResult::Continue)
+    }
+
+    fn put_static(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let field_ref = self.resolve_field_ref(memory, index)?;
+        let class_id = memory
+            .method_area
+            .class_id(&field_ref.class_name)
+            .ok_or_else(|| VmError::ClassNotFound(field_ref.class_name.clone()))?;
+        if self.ensure_class_initialized(memory, class_id)? {
+            return Ok(StepResult::Continue);
+        }
+        let value = self.pop_value(memory)?;
+        let field = self.static_field_mut(memory, &field_ref)?;
+        *field = value;
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn static_field<'a>(
+        &self,
+        memory: &'a VirtualMemory,
+        field_ref: &RuntimeFieldRef,
+    ) -> Result<&'a Value, VmError> {
+        let class_id = memory
+            .method_area
+            .class_id(&field_ref.class_name)
+            .ok_or_else(|| VmError::ClassNotFound(field_ref.class_name.clone()))?;
+        let class = memory
+            .method_area
+            .class(class_id)
+            .ok_or_else(|| VmError::ClassNotFound(field_ref.class_name.clone()))?;
+        let field = class
+            .find_field(&field_ref.name, &field_ref.descriptor)
+            .ok_or_else(|| VmError::NoSuchField {
+                class: field_ref.class_name.clone(),
+                name: field_ref.name.clone(),
+                descriptor: field_ref.descriptor.clone(),
+            })?;
+        if !field.is_static() {
+            return Err(VmError::IncompatibleClassChange(format!(
+                "{}.{} is not static",
+                field_ref.class_name, field_ref.name
+            )));
+        }
+        class.static_fields.get(field.id.0).ok_or_else(|| {
+            VmError::VerificationError(format!("static field {:?} does not exist", field.id))
+        })
+    }
+
+    fn static_field_mut<'a>(
+        &self,
+        memory: &'a mut VirtualMemory,
+        field_ref: &RuntimeFieldRef,
+    ) -> Result<&'a mut Value, VmError> {
+        let class_id = memory
+            .method_area
+            .class_id(&field_ref.class_name)
+            .ok_or_else(|| VmError::ClassNotFound(field_ref.class_name.clone()))?;
+        let field_id = {
+            let class = memory
+                .method_area
+                .class(class_id)
+                .ok_or_else(|| VmError::ClassNotFound(field_ref.class_name.clone()))?;
+            let field = class
+                .find_field(&field_ref.name, &field_ref.descriptor)
+                .ok_or_else(|| VmError::NoSuchField {
+                    class: field_ref.class_name.clone(),
+                    name: field_ref.name.clone(),
+                    descriptor: field_ref.descriptor.clone(),
+                })?;
+            if !field.is_static() {
+                return Err(VmError::IncompatibleClassChange(format!(
+                    "{}.{} is not static",
+                    field_ref.class_name, field_ref.name
+                )));
+            }
+            field.id
+        };
+
+        memory
+            .method_area
+            .class_mut(class_id)
+            .ok_or_else(|| VmError::ClassNotFound(field_ref.class_name.clone()))?
+            .static_fields
+            .get_mut(field_id.0)
+            .ok_or_else(|| {
+                VmError::VerificationError(format!("static field {:?} does not exist", field_id))
+            })
     }
 
     fn resolve_class_ref(&self, memory: &VirtualMemory, index: CpIndex) -> Result<String, VmError> {
@@ -980,15 +1083,9 @@ impl VirtualCpu {
             .method_area
             .class(object.class_id)
             .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", object.class_id)))?;
-        let field = class
-            .find_field(&field_ref.name, &field_ref.descriptor)
-            .ok_or_else(|| VmError::NoSuchField {
-                class: field_ref.class_name.clone(),
-                name: field_ref.name.clone(),
-                descriptor: field_ref.descriptor.clone(),
-            })?;
-        object.fields.get(field.id.0).ok_or_else(|| {
-            VmError::VerificationError(format!("field {:?} does not exist", field.id))
+        let field_index = self.instance_field_index(class, field_ref)?;
+        object.fields.get(field_index).ok_or_else(|| {
+            VmError::VerificationError(format!("field {field_index} does not exist"))
         })
     }
 
@@ -998,7 +1095,7 @@ impl VirtualCpu {
         object_ref: ObjectRef,
         field_ref: &RuntimeFieldRef,
     ) -> Result<&'a mut Value, VmError> {
-        let field_id = {
+        let field_index = {
             let object = match memory.heap.get(object_ref) {
                 Some(HeapEntry::Object(object)) => object,
                 Some(_) => {
@@ -1016,20 +1113,15 @@ impl VirtualCpu {
                 .method_area
                 .class(object.class_id)
                 .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", object.class_id)))?;
-            class
-                .find_field(&field_ref.name, &field_ref.descriptor)
-                .ok_or_else(|| VmError::NoSuchField {
-                    class: field_ref.class_name.clone(),
-                    name: field_ref.name.clone(),
-                    descriptor: field_ref.descriptor.clone(),
-                })?
-                .id
+            self.instance_field_index(class, field_ref)?
         };
 
         match memory.heap.get_mut(object_ref) {
-            Some(HeapEntry::Object(object)) => object.fields.get_mut(field_id.0).ok_or_else(|| {
-                VmError::VerificationError(format!("field {:?} does not exist", field_id))
-            }),
+            Some(HeapEntry::Object(object)) => {
+                object.fields.get_mut(field_index).ok_or_else(|| {
+                    VmError::VerificationError(format!("field {field_index} does not exist"))
+                })
+            }
             Some(_) => Err(VmError::VerificationError(
                 "reference does not point to an object".to_string(),
             )),
@@ -1039,29 +1131,148 @@ impl VirtualCpu {
         }
     }
 
+    fn instance_field_index(
+        &self,
+        class: &crate::vm::class::RuntimeClass,
+        field_ref: &RuntimeFieldRef,
+    ) -> Result<usize, VmError> {
+        let mut instance_index = 0usize;
+        for field in &class.fields {
+            if field.name == field_ref.name && field.descriptor_source == field_ref.descriptor {
+                if field.is_static() {
+                    return Err(VmError::IncompatibleClassChange(format!(
+                        "{}.{} is static",
+                        field_ref.class_name, field_ref.name
+                    )));
+                }
+                return Ok(instance_index);
+            }
+            if !field.is_static() {
+                instance_index += 1;
+            }
+        }
+
+        Err(VmError::NoSuchField {
+            class: field_ref.class_name.clone(),
+            name: field_ref.name.clone(),
+            descriptor: field_ref.descriptor.clone(),
+        })
+    }
+
+    pub(crate) fn ensure_class_initialized(
+        &self,
+        memory: &mut VirtualMemory,
+        class_id: crate::vm::ids::ClassId,
+    ) -> Result<bool, VmError> {
+        let clinit = {
+            let class = memory
+                .method_area
+                .class(class_id)
+                .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", class_id)))?;
+            match class.state {
+                ClassState::Initialized | ClassState::Initializing => return Ok(false),
+                ClassState::Failed => {
+                    return Err(VmError::LinkageError(format!(
+                        "class {} initialization previously failed",
+                        class.name
+                    )));
+                }
+                ClassState::Loaded | ClassState::Linked => {}
+            }
+
+            class
+                .find_method("<clinit>", "()V")
+                .map(|method| {
+                    let code = method.code.clone().ok_or_else(|| {
+                        VmError::UnsupportedFeature(UnsupportedFeature::NativeMethod {
+                            class: class.name.clone(),
+                            name: method.name.clone(),
+                            descriptor: method.descriptor_source.clone(),
+                        })
+                    })?;
+                    Ok::<_, VmError>((method.id, method.max_locals as usize, code))
+                })
+                .transpose()?
+        };
+
+        let Some((method_id, max_locals, code)) = clinit else {
+            memory
+                .method_area
+                .class_mut(class_id)
+                .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", class_id)))?
+                .state = ClassState::Initialized;
+            return Ok(false);
+        };
+
+        memory
+            .method_area
+            .class_mut(class_id)
+            .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", class_id)))?
+            .state = ClassState::Initializing;
+        memory
+            .thread_mut(self.current_thread)
+            .ok_or_else(|| {
+                VmError::InternalError(format!("thread {:?} does not exist", self.current_thread))
+            })?
+            .push_frame(Frame::new(class_id, method_id, max_locals, code));
+        Ok(true)
+    }
+
     fn return_from_frame(
         &self,
         memory: &mut VirtualMemory,
         value: Option<Value>,
     ) -> Result<StepResult, VmError> {
-        let thread = memory.thread_mut(self.current_thread).ok_or_else(|| {
-            VmError::InternalError(format!("thread {:?} does not exist", self.current_thread))
-        })?;
-        thread.pop_frame().ok_or_else(|| {
-            VmError::InternalError(format!(
-                "thread {:?} has no frame to return from",
-                self.current_thread
-            ))
-        })?;
+        let (returned_frame, has_caller) = {
+            let thread = memory.thread_mut(self.current_thread).ok_or_else(|| {
+                VmError::InternalError(format!("thread {:?} does not exist", self.current_thread))
+            })?;
+            let returned_frame = thread.pop_frame().ok_or_else(|| {
+                VmError::InternalError(format!(
+                    "thread {:?} has no frame to return from",
+                    self.current_thread
+                ))
+            })?;
 
-        if let Some(caller) = thread.current_frame_mut() {
-            if let Some(value) = value.clone() {
-                caller.operand_stack.push(value);
+            if let Some(caller) = thread.current_frame_mut() {
+                if let Some(value) = value.clone() {
+                    caller.operand_stack.push(value);
+                }
+                (returned_frame, true)
+            } else {
+                (returned_frame, false)
             }
+        };
+
+        self.finish_class_initialization_if_needed(memory, &returned_frame)?;
+
+        if has_caller {
             Ok(StepResult::Continue)
         } else {
             Ok(StepResult::Return(value))
         }
+    }
+
+    fn finish_class_initialization_if_needed(
+        &self,
+        memory: &mut VirtualMemory,
+        frame: &Frame,
+    ) -> Result<(), VmError> {
+        let is_clinit = memory
+            .method_area
+            .class(frame.class_id)
+            .and_then(|class| class.methods.get(frame.method_id.0))
+            .is_some_and(|method| method.name == "<clinit>" && method.descriptor_source == "()V");
+
+        if is_clinit {
+            memory
+                .method_area
+                .class_mut(frame.class_id)
+                .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", frame.class_id)))?
+                .state = ClassState::Initialized;
+        }
+
+        Ok(())
     }
 
     fn push(&self, memory: &mut VirtualMemory, value: Value) -> Result<(), VmError> {

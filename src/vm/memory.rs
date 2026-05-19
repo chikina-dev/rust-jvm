@@ -7,7 +7,7 @@ use crate::vm::{
     value::Value,
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MethodArea {
     pub classes: Vec<RuntimeClass>,
     pub class_by_name: HashMap<String, ClassId>,
@@ -25,6 +25,7 @@ impl MethodArea {
             id,
             name: name.clone(),
             fields: Vec::new(),
+            static_fields: Vec::new(),
             class_refs: HashMap::new(),
             field_refs: HashMap::new(),
             methods: Vec::new(),
@@ -49,6 +50,10 @@ impl MethodArea {
 
     pub fn class(&self, id: ClassId) -> Option<&RuntimeClass> {
         self.classes.get(id.0)
+    }
+
+    pub fn class_mut(&mut self, id: ClassId) -> Option<&mut RuntimeClass> {
+        self.classes.get_mut(id.0)
     }
 
     pub fn class_id(&self, name: &str) -> Option<ClassId> {

@@ -56,6 +56,7 @@ pub enum DecodedInstructionKind {
     NewArray(u8),
     ArrayLength,
     GetStatic(CpIndex),
+    PutStatic(CpIndex),
     GetField(CpIndex),
     PutField(CpIndex),
     Return,
@@ -165,6 +166,7 @@ fn decode_kind(byte: &CodeByte) -> Result<DecodedInstructionKind, ParseError> {
         0xb0 => Ok(DecodedInstructionKind::AReturn),
         0xb1 => Ok(DecodedInstructionKind::Return),
         0xb2 => Ok(DecodedInstructionKind::GetStatic(CpIndex(read_u16(byte)?))),
+        0xb3 => Ok(DecodedInstructionKind::PutStatic(CpIndex(read_u16(byte)?))),
         0xb4 => Ok(DecodedInstructionKind::GetField(CpIndex(read_u16(byte)?))),
         0xb5 => Ok(DecodedInstructionKind::PutField(CpIndex(read_u16(byte)?))),
         0xb6 => Ok(DecodedInstructionKind::InvokeVirtual(CpIndex(read_u16(

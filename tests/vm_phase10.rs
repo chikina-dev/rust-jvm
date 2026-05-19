@@ -20,15 +20,15 @@ fn fixture_source_path(class_name: &str) -> PathBuf {
 }
 
 fn compile_fixture(class_name: &str) -> Option<PathBuf> {
-    let millis = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after unix epoch")
-        .as_millis();
+        .as_nanos();
     let dir = std::env::temp_dir().join(format!(
         "rust_jvm_vm_phase10_{}_{}_{}",
         std::process::id(),
         class_name,
-        millis
+        nanos
     ));
     fs::create_dir_all(&dir).expect("failed to create javac temp dir");
 
