@@ -29,10 +29,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up JDK
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: ${{ matrix.java-version }}
@@ -54,7 +54,7 @@ jobs:
           find target/e2e-java-classes -name '*.class' -print | sort
 
       - name: Upload Java fixtures
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: java-classes-${{ matrix.java-version }}-${{ matrix.java-release || 'default' }}
           path: target/e2e-java-classes/${{ matrix.java-version }}-${{ matrix.java-release || 'default' }}
@@ -66,13 +66,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Download Java fixtures
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: java-classes-*
           path: target/e2e-java-fixtures
