@@ -1,10 +1,6 @@
 use std::env;
 
-mod util;
-mod structure;
-
-mod class_leader;
-mod javap;
+use rust_jvm::{class_leader, javap};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
