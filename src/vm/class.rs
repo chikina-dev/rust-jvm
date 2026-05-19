@@ -30,6 +30,7 @@ pub struct RuntimeClass {
     pub field_refs: HashMap<CpIndex, RuntimeFieldRef>,
     pub methods: Vec<RuntimeMethod>,
     pub method_refs: HashMap<CpIndex, RuntimeMethodRef>,
+    pub string_refs: HashMap<CpIndex, String>,
     pub state: ClassState,
 }
 
@@ -55,6 +56,7 @@ impl RuntimeClass {
         let class_refs = collect_class_refs(class_file)?;
         let field_refs = collect_field_refs(class_file)?;
         let method_refs = collect_method_refs(class_file)?;
+        let string_refs = collect_string_refs(class_file)?;
 
         Ok(Self {
             id,
@@ -64,6 +66,7 @@ impl RuntimeClass {
             field_refs,
             methods,
             method_refs,
+            string_refs,
             state: ClassState::Loaded,
         })
     }
@@ -231,6 +234,10 @@ fn collect_method_refs(
         if let Constant::Methodref {
             class_index,
             name_and_type_index,
+        }
+        | Constant::InterfaceMethodref {
+            class_index,
+            name_and_type_index,
         } = constant
         {
             let cp_index = CpIndex((zero_based_index + 1) as u16);
@@ -248,6 +255,21 @@ fn collect_method_refs(
                     name,
                     descriptor,
                 },
+            );
+        }
+    }
+
+    Ok(refs)
+}
+
+fn collect_string_refs(class_file: &ClassFile) -> Result<HashMap<CpIndex, String>, VmError> {
+    let mut refs = HashMap::new();
+
+    for (zero_based_index, constant) in class_file.constant_pool.constants.iter().enumerate() {
+        if let Constant::String { string_index } = constant {
+            refs.insert(
+                CpIndex((zero_based_index + 1) as u16),
+                class_file.constant_pool.utf8(CpIndex(*string_index))?,
             );
         }
     }

@@ -7,6 +7,9 @@ pub enum Value {
     Float(f32),
     Double(f64),
     Ref(Option<ObjectRef>),
+    String(String),
+    NativeStdout,
+    NativeStderr,
     ReturnAddress(u32),
 }
 

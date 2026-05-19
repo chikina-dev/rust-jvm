@@ -116,6 +116,7 @@ impl VirtualCpu {
                 self.set_pc(memory, instruction.next_pc)?;
                 Ok(StepResult::Continue)
             }
+            DecodedInstructionKind::Ldc(index) => self.ldc(memory, instruction, *index),
             DecodedInstructionKind::ILoad(index) => {
                 let value = self.local(memory, *index)?;
                 self.push(memory, value)?;
@@ -257,9 +258,15 @@ impl VirtualCpu {
             DecodedInstructionKind::InvokeSpecial(index) => {
                 self.invoke_special_instruction(memory, instruction, *index)
             }
+            DecodedInstructionKind::InvokeVirtual(index) => {
+                self.invoke_virtual_instruction(memory, instruction, *index)
+            }
             DecodedInstructionKind::New(index) => self.new_object(memory, instruction, *index),
             DecodedInstructionKind::NewArray(atype) => self.new_array(memory, instruction, *atype),
             DecodedInstructionKind::ArrayLength => self.array_length(memory, instruction),
+            DecodedInstructionKind::GetStatic(index) => {
+                self.get_static(memory, instruction, *index)
+            }
             DecodedInstructionKind::GetField(index) => self.get_field(memory, instruction, *index),
             DecodedInstructionKind::PutField(index) => self.put_field(memory, instruction, *index),
             DecodedInstructionKind::IReturn => {
@@ -297,6 +304,27 @@ impl VirtualCpu {
         let lhs = self.pop_int(memory)?;
         self.push(memory, Value::Int(operation(lhs, rhs)))?;
         self.set_pc(memory, next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn ldc(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let value = self
+            .current_class(memory)?
+            .string_refs
+            .get(&index)
+            .cloned()
+            .map(Value::String)
+            .ok_or_else(|| VmError::ConstantResolution {
+                index,
+                reason: "unsupported ldc constant".to_string(),
+            })?;
+        self.push(memory, value)?;
+        self.set_pc(memory, instruction.next_pc)?;
         Ok(StepResult::Continue)
     }
 
@@ -640,6 +668,63 @@ impl VirtualCpu {
         Ok(StepResult::Continue)
     }
 
+    fn invoke_virtual_instruction(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let method_ref = self.resolve_method_ref(memory, index)?;
+        if method_ref.class_name == "java/io/PrintStream"
+            && (method_ref.name == "println" || method_ref.name == "print")
+        {
+            let descriptor =
+                crate::vm::descriptor::parse_method_descriptor(&method_ref.descriptor)?;
+            let mut args = Vec::with_capacity(descriptor.parameters.len());
+            for _ in 0..descriptor.parameters.len() {
+                args.push(self.pop_value(memory)?);
+            }
+            args.reverse();
+
+            let receiver = self.pop_value(memory)?;
+            let is_stderr = match receiver {
+                Value::NativeStdout => false,
+                Value::NativeStderr => true,
+                value => {
+                    return Err(VmError::VerificationError(format!(
+                        "println expected PrintStream receiver, found {value:?}"
+                    )));
+                }
+            };
+            let text = if let Some(value) = args.first() {
+                printable_value(value)?
+            } else {
+                String::new()
+            };
+            let text = if method_ref.name == "println" {
+                format!("{text}\n")
+            } else {
+                text
+            };
+
+            if is_stderr {
+                memory.stderr.push(text);
+            } else {
+                memory.stdout.push(text);
+            }
+            self.set_pc(memory, instruction.next_pc)?;
+            return Ok(StepResult::Continue);
+        }
+
+        Err(VmError::UnsupportedFeature(
+            UnsupportedFeature::NativeMethod {
+                class: method_ref.class_name,
+                name: method_ref.name,
+                descriptor: method_ref.descriptor,
+            },
+        ))
+    }
+
     fn resolve_method_ref(
         &self,
         memory: &VirtualMemory,
@@ -694,6 +779,35 @@ impl VirtualCpu {
         let object = self.require_object_ref(self.pop_ref(memory)?)?;
         let field = self.object_field_mut(memory, object, &field_ref)?;
         *field = value;
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn get_static(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let field_ref = self.resolve_field_ref(memory, index)?;
+        let value = match (
+            field_ref.class_name.as_str(),
+            field_ref.name.as_str(),
+            field_ref.descriptor.as_str(),
+        ) {
+            ("java/lang/System", "out", "Ljava/io/PrintStream;") => Value::NativeStdout,
+            ("java/lang/System", "err", "Ljava/io/PrintStream;") => Value::NativeStderr,
+            _ => {
+                return Err(VmError::UnsupportedFeature(
+                    UnsupportedFeature::NativeMethod {
+                        class: field_ref.class_name,
+                        name: field_ref.name,
+                        descriptor: field_ref.descriptor,
+                    },
+                ));
+            }
+        };
+        self.push(memory, value)?;
         self.set_pc(memory, instruction.next_pc)?;
         Ok(StepResult::Continue)
     }
@@ -980,13 +1094,33 @@ impl MnemonicFallback for DecodedInstructionKind {
             DecodedInstructionKind::IInc { .. } => "iinc",
             DecodedInstructionKind::InvokeStatic(_) => "invokestatic",
             DecodedInstructionKind::InvokeSpecial(_) => "invokespecial",
+            DecodedInstructionKind::InvokeVirtual(_) => "invokevirtual",
             DecodedInstructionKind::New(_) => "new",
             DecodedInstructionKind::NewArray(_) => "newarray",
             DecodedInstructionKind::ArrayLength => "arraylength",
+            DecodedInstructionKind::GetStatic(_) => "getstatic",
             DecodedInstructionKind::GetField(_) => "getfield",
             DecodedInstructionKind::PutField(_) => "putfield",
             DecodedInstructionKind::AReturn => "areturn",
             _ => "unsupported",
         }
+    }
+}
+
+fn printable_value(value: &Value) -> Result<String, VmError> {
+    match value {
+        Value::Int(value) => Ok(value.to_string()),
+        Value::Long(value) => Ok(value.to_string()),
+        Value::Float(value) => Ok(value.to_string()),
+        Value::Double(value) => Ok(value.to_string()),
+        Value::String(value) => Ok(value.clone()),
+        Value::Ref(None) => Ok("null".to_string()),
+        value => Err(VmError::UnsupportedFeature(
+            UnsupportedFeature::NativeMethod {
+                class: "java/io/PrintStream".to_string(),
+                name: "println".to_string(),
+                descriptor: format!("{value:?}"),
+            },
+        )),
     }
 }

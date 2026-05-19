@@ -29,6 +29,7 @@ impl MethodArea {
             field_refs: HashMap::new(),
             methods: Vec::new(),
             method_refs: HashMap::new(),
+            string_refs: HashMap::new(),
             state: crate::vm::class::ClassState::Loaded,
         });
         self.class_by_name.insert(name, id);
@@ -107,6 +108,8 @@ pub struct VirtualMemory {
     pub method_area: MethodArea,
     pub heap: Heap,
     pub threads: Vec<VmThread>,
+    pub stdout: Vec<String>,
+    pub stderr: Vec<String>,
 }
 
 impl VirtualMemory {
