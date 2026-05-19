@@ -8,6 +8,7 @@ use crate::vm::{
     instruction::{DecodedInstruction, DecodedInstructionKind},
     invocation::ResolvedMethod,
     memory::{Array, HeapEntry, VirtualMemory},
+    native::{NativeInvokeResult, NativeMethods},
     value::Value,
 };
 
@@ -707,45 +708,15 @@ impl VirtualCpu {
         index: CpIndex,
     ) -> Result<StepResult, VmError> {
         let method_ref = self.resolve_method_ref(memory, index)?;
-        if method_ref.class_name == "java/io/PrintStream"
-            && (method_ref.name == "println" || method_ref.name == "print")
-        {
-            let descriptor =
-                crate::vm::descriptor::parse_method_descriptor(&method_ref.descriptor)?;
-            let mut args = Vec::with_capacity(descriptor.parameters.len());
-            for _ in 0..descriptor.parameters.len() {
-                args.push(self.pop_value(memory)?);
-            }
-            args.reverse();
-
+        if let Some(parameter_count) = NativeMethods::virtual_parameter_count(&method_ref)? {
+            let args = self.pop_arguments(memory, parameter_count)?;
             let receiver = self.pop_value(memory)?;
-            let is_stderr = match receiver {
-                Value::NativeStdout => false,
-                Value::NativeStderr => true,
-                value => {
-                    return Err(VmError::VerificationError(format!(
-                        "println expected PrintStream receiver, found {value:?}"
-                    )));
-                }
-            };
-            let text = if let Some(value) = args.first() {
-                printable_value(value)?
-            } else {
-                String::new()
-            };
-            let text = if method_ref.name == "println" {
-                format!("{text}\n")
-            } else {
-                text
-            };
-
-            if is_stderr {
-                memory.stderr.push(text);
-            } else {
-                memory.stdout.push(text);
+            if NativeMethods::invoke_virtual(memory, &method_ref, receiver, args)?
+                == NativeInvokeResult::Handled
+            {
+                self.set_pc(memory, instruction.next_pc)?;
+                return Ok(StepResult::Continue);
             }
-            self.set_pc(memory, instruction.next_pc)?;
-            return Ok(StepResult::Continue);
         }
 
         Err(VmError::UnsupportedFeature(
@@ -1316,23 +1287,5 @@ impl VirtualCpu {
                     self.current_thread
                 ))
             })
-    }
-}
-
-fn printable_value(value: &Value) -> Result<String, VmError> {
-    match value {
-        Value::Int(value) => Ok(value.to_string()),
-        Value::Long(value) => Ok(value.to_string()),
-        Value::Float(value) => Ok(value.to_string()),
-        Value::Double(value) => Ok(value.to_string()),
-        Value::String(value) => Ok(value.clone()),
-        Value::Ref(None) => Ok("null".to_string()),
-        value => Err(VmError::UnsupportedFeature(
-            UnsupportedFeature::NativeMethod {
-                class: "java/io/PrintStream".to_string(),
-                name: "println".to_string(),
-                descriptor: format!("{value:?}"),
-            },
-        )),
     }
 }

@@ -10,6 +10,7 @@ pub mod instruction;
 pub mod invocation;
 pub mod loader;
 pub mod memory;
+pub mod native;
 pub mod thread;
 pub mod value;
 pub mod vm;
