@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Rust stable / JDK ${{ matrix.java-version }} / release ${{ matrix.java-release || 'default' }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - java-version: "17"
+            java-release: ""
+          - java-version: "21"
+            java-release: ""
+          - java-version: "21"
+            java-release: "17"
+          - java-version: "25"
+            java-release: ""
+          - java-version: "25"
+            java-release: "21"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show tool versions
+        run: |
+          rustc --version
+          cargo --version
+          javac -version
+
+      - name: Test
+        env:
+          RUST_JVM_E2E_JAVA_RELEASE: ${{ matrix.java-release }}
+        run: cargo test --all-targets
