@@ -1,10 +1,10 @@
 use crate::vm::{
-    class::RuntimeMethodRef,
+    class::{RuntimeFieldRef, RuntimeMethodRef},
     error::{UnsupportedFeature, VmError},
     frame::Frame,
-    ids::{CpIndex, ThreadId},
+    ids::{CpIndex, ObjectRef, ThreadId},
     instruction::{DecodedInstruction, DecodedInstructionKind},
-    memory::VirtualMemory,
+    memory::{HeapEntry, VirtualMemory},
     value::Value,
 };
 
@@ -120,9 +120,48 @@ impl VirtualCpu {
                 self.set_pc(memory, instruction.next_pc)?;
                 Ok(StepResult::Continue)
             }
+            DecodedInstructionKind::ALoad(index) => {
+                let value = self.local(memory, *index)?;
+                match value {
+                    Value::Ref(_) => {
+                        self.push(memory, value)?;
+                        self.set_pc(memory, instruction.next_pc)?;
+                        Ok(StepResult::Continue)
+                    }
+                    value => Err(VmError::VerificationError(format!(
+                        "expected reference in local {index}, found {value:?}"
+                    ))),
+                }
+            }
             DecodedInstructionKind::IStore(index) => {
                 let value = self.pop_int(memory)?;
                 self.set_local(memory, *index, Value::Int(value))?;
+                self.set_pc(memory, instruction.next_pc)?;
+                Ok(StepResult::Continue)
+            }
+            DecodedInstructionKind::AStore(index) => {
+                let value = self.pop_value(memory)?;
+                match value {
+                    Value::Ref(_) => {
+                        self.set_local(memory, *index, value)?;
+                        self.set_pc(memory, instruction.next_pc)?;
+                        Ok(StepResult::Continue)
+                    }
+                    value => Err(VmError::VerificationError(format!(
+                        "expected reference on operand stack, found {value:?}"
+                    ))),
+                }
+            }
+            DecodedInstructionKind::Dup => {
+                let value = self
+                    .current_frame_mut(memory)?
+                    .operand_stack
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| {
+                        VmError::VerificationError("operand stack underflow".to_string())
+                    })?;
+                self.push(memory, value)?;
                 self.set_pc(memory, instruction.next_pc)?;
                 Ok(StepResult::Continue)
             }
@@ -211,9 +250,19 @@ impl VirtualCpu {
             DecodedInstructionKind::InvokeStatic(index) => {
                 self.invoke_static_instruction(memory, instruction, *index)
             }
+            DecodedInstructionKind::InvokeSpecial(index) => {
+                self.invoke_special_instruction(memory, instruction, *index)
+            }
+            DecodedInstructionKind::New(index) => self.new_object(memory, instruction, *index),
+            DecodedInstructionKind::GetField(index) => self.get_field(memory, instruction, *index),
+            DecodedInstructionKind::PutField(index) => self.put_field(memory, instruction, *index),
             DecodedInstructionKind::IReturn => {
                 let value = Value::Int(self.pop_int(memory)?);
                 self.return_from_frame(memory, Some(value))
+            }
+            DecodedInstructionKind::AReturn => {
+                let value = self.pop_ref(memory)?;
+                self.return_from_frame(memory, Some(Value::Ref(value)))
             }
             DecodedInstructionKind::Return => self.return_from_frame(memory, None),
             DecodedInstructionKind::Unsupported { mnemonic } => {
@@ -275,6 +324,28 @@ impl VirtualCpu {
         } else {
             self.set_pc(memory, instruction.next_pc)?;
         }
+        Ok(StepResult::Continue)
+    }
+
+    fn new_object(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let class_name = self.resolve_class_ref(memory, index)?;
+        let class_id = memory
+            .method_area
+            .class_id(&class_name)
+            .ok_or_else(|| VmError::ClassNotFound(class_name.clone()))?;
+        let fields = memory
+            .method_area
+            .class(class_id)
+            .ok_or_else(|| VmError::ClassNotFound(class_name.clone()))?
+            .default_instance_fields();
+        let reference = memory.heap.allocate_object(class_id, fields);
+        self.push(memory, Value::Ref(Some(reference)))?;
+        self.set_pc(memory, instruction.next_pc)?;
         Ok(StepResult::Continue)
     }
 
@@ -343,6 +414,97 @@ impl VirtualCpu {
         Ok(StepResult::Continue)
     }
 
+    fn invoke_special_instruction(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let method_ref = self.resolve_method_ref(memory, index)?;
+        let parameter_count =
+            crate::vm::descriptor::parse_method_descriptor(&method_ref.descriptor)?
+                .parameters
+                .len();
+
+        if method_ref.class_name == "java/lang/Object"
+            && method_ref.name == "<init>"
+            && method_ref.descriptor == "()V"
+        {
+            let object = self.pop_ref(memory)?;
+            if object.is_none() {
+                return Err(VmError::RuntimeException(
+                    "NullPointerException".to_string(),
+                ));
+            }
+            self.set_pc(memory, instruction.next_pc)?;
+            return Ok(StepResult::Continue);
+        }
+
+        let class_id = memory
+            .method_area
+            .class_id(&method_ref.class_name)
+            .ok_or_else(|| VmError::ClassNotFound(method_ref.class_name.clone()))?;
+        let (method_id, max_locals, code) = {
+            let class = memory
+                .method_area
+                .class(class_id)
+                .ok_or_else(|| VmError::ClassNotFound(method_ref.class_name.clone()))?;
+            let method = class
+                .find_method(&method_ref.name, &method_ref.descriptor)
+                .ok_or_else(|| VmError::NoSuchMethod {
+                    class: method_ref.class_name.clone(),
+                    name: method_ref.name.clone(),
+                    descriptor: method_ref.descriptor.clone(),
+                })?;
+            let code = method.code.clone().ok_or_else(|| {
+                VmError::UnsupportedFeature(UnsupportedFeature::NativeMethod {
+                    class: method_ref.class_name.clone(),
+                    name: method_ref.name.clone(),
+                    descriptor: method_ref.descriptor.clone(),
+                })
+            })?;
+
+            (method.id, method.max_locals as usize, code)
+        };
+
+        let mut args = Vec::with_capacity(parameter_count);
+        for _ in 0..parameter_count {
+            args.push(self.pop_value(memory)?);
+        }
+        args.reverse();
+        let object = self.pop_ref(memory)?;
+        if object.is_none() {
+            return Err(VmError::RuntimeException(
+                "NullPointerException".to_string(),
+            ));
+        }
+
+        self.set_pc(memory, instruction.next_pc)?;
+
+        let mut frame = Frame::new(class_id, method_id, max_locals, code);
+        let receiver = frame
+            .locals
+            .get_mut(0)
+            .ok_or_else(|| VmError::VerificationError("local 0 does not exist".to_string()))?;
+        *receiver = Value::Ref(object);
+        for (index, value) in args.into_iter().enumerate() {
+            let local_index = index + 1;
+            let local = frame.locals.get_mut(local_index).ok_or_else(|| {
+                VmError::VerificationError(format!("local {local_index} does not exist"))
+            })?;
+            *local = value;
+        }
+
+        memory
+            .thread_mut(self.current_thread)
+            .ok_or_else(|| {
+                VmError::InternalError(format!("thread {:?} does not exist", self.current_thread))
+            })?
+            .push_frame(frame);
+
+        Ok(StepResult::Continue)
+    }
+
     fn resolve_method_ref(
         &self,
         memory: &VirtualMemory,
@@ -370,6 +532,164 @@ impl VirtualCpu {
                 index,
                 reason: "expected Methodref constant".to_string(),
             })
+    }
+
+    fn get_field(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let field_ref = self.resolve_field_ref(memory, index)?;
+        let object = self.require_object_ref(self.pop_ref(memory)?)?;
+        let value = self.object_field(memory, object, &field_ref)?.clone();
+        self.push(memory, value)?;
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn put_field(
+        &self,
+        memory: &mut VirtualMemory,
+        instruction: &DecodedInstruction,
+        index: CpIndex,
+    ) -> Result<StepResult, VmError> {
+        let field_ref = self.resolve_field_ref(memory, index)?;
+        let value = self.pop_value(memory)?;
+        let object = self.require_object_ref(self.pop_ref(memory)?)?;
+        let field = self.object_field_mut(memory, object, &field_ref)?;
+        *field = value;
+        self.set_pc(memory, instruction.next_pc)?;
+        Ok(StepResult::Continue)
+    }
+
+    fn resolve_class_ref(&self, memory: &VirtualMemory, index: CpIndex) -> Result<String, VmError> {
+        let class = self.current_class(memory)?;
+        class
+            .class_refs
+            .get(&index)
+            .cloned()
+            .ok_or_else(|| VmError::ConstantResolution {
+                index,
+                reason: "expected Class constant".to_string(),
+            })
+    }
+
+    fn resolve_field_ref(
+        &self,
+        memory: &VirtualMemory,
+        index: CpIndex,
+    ) -> Result<RuntimeFieldRef, VmError> {
+        let class = self.current_class(memory)?;
+        class
+            .field_refs
+            .get(&index)
+            .cloned()
+            .ok_or_else(|| VmError::ConstantResolution {
+                index,
+                reason: "expected Fieldref constant".to_string(),
+            })
+    }
+
+    fn current_class<'a>(
+        &self,
+        memory: &'a VirtualMemory,
+    ) -> Result<&'a crate::vm::class::RuntimeClass, VmError> {
+        let thread = memory.thread(self.current_thread).ok_or_else(|| {
+            VmError::InternalError(format!("thread {:?} does not exist", self.current_thread))
+        })?;
+        let frame = thread.current_frame().ok_or_else(|| {
+            VmError::InternalError(format!(
+                "thread {:?} has no current frame",
+                self.current_thread
+            ))
+        })?;
+        memory
+            .method_area
+            .class(frame.class_id)
+            .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", frame.class_id)))
+    }
+
+    fn object_field<'a>(
+        &self,
+        memory: &'a VirtualMemory,
+        object_ref: ObjectRef,
+        field_ref: &RuntimeFieldRef,
+    ) -> Result<&'a Value, VmError> {
+        let object = match memory.heap.get(object_ref) {
+            Some(HeapEntry::Object(object)) => object,
+            Some(_) => {
+                return Err(VmError::VerificationError(
+                    "reference does not point to an object".to_string(),
+                ));
+            }
+            None => {
+                return Err(VmError::RuntimeException(
+                    "invalid object reference".to_string(),
+                ));
+            }
+        };
+        let class = memory
+            .method_area
+            .class(object.class_id)
+            .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", object.class_id)))?;
+        let field = class
+            .find_field(&field_ref.name, &field_ref.descriptor)
+            .ok_or_else(|| VmError::NoSuchField {
+                class: field_ref.class_name.clone(),
+                name: field_ref.name.clone(),
+                descriptor: field_ref.descriptor.clone(),
+            })?;
+        object.fields.get(field.id.0).ok_or_else(|| {
+            VmError::VerificationError(format!("field {:?} does not exist", field.id))
+        })
+    }
+
+    fn object_field_mut<'a>(
+        &self,
+        memory: &'a mut VirtualMemory,
+        object_ref: ObjectRef,
+        field_ref: &RuntimeFieldRef,
+    ) -> Result<&'a mut Value, VmError> {
+        let field_id = {
+            let object = match memory.heap.get(object_ref) {
+                Some(HeapEntry::Object(object)) => object,
+                Some(_) => {
+                    return Err(VmError::VerificationError(
+                        "reference does not point to an object".to_string(),
+                    ));
+                }
+                None => {
+                    return Err(VmError::RuntimeException(
+                        "invalid object reference".to_string(),
+                    ));
+                }
+            };
+            let class = memory
+                .method_area
+                .class(object.class_id)
+                .ok_or_else(|| VmError::ClassNotFound(format!("{:?}", object.class_id)))?;
+            class
+                .find_field(&field_ref.name, &field_ref.descriptor)
+                .ok_or_else(|| VmError::NoSuchField {
+                    class: field_ref.class_name.clone(),
+                    name: field_ref.name.clone(),
+                    descriptor: field_ref.descriptor.clone(),
+                })?
+                .id
+        };
+
+        match memory.heap.get_mut(object_ref) {
+            Some(HeapEntry::Object(object)) => object.fields.get_mut(field_id.0).ok_or_else(|| {
+                VmError::VerificationError(format!("field {:?} does not exist", field_id))
+            }),
+            Some(_) => Err(VmError::VerificationError(
+                "reference does not point to an object".to_string(),
+            )),
+            None => Err(VmError::RuntimeException(
+                "invalid object reference".to_string(),
+            )),
+        }
     }
 
     fn return_from_frame(
@@ -407,6 +727,19 @@ impl VirtualCpu {
             .operand_stack
             .pop()
             .ok_or_else(|| VmError::VerificationError("operand stack underflow".to_string()))
+    }
+
+    fn pop_ref(&self, memory: &mut VirtualMemory) -> Result<Option<ObjectRef>, VmError> {
+        match self.pop_value(memory)? {
+            Value::Ref(value) => Ok(value),
+            value => Err(VmError::VerificationError(format!(
+                "expected reference on operand stack, found {value:?}"
+            ))),
+        }
+    }
+
+    fn require_object_ref(&self, value: Option<ObjectRef>) -> Result<ObjectRef, VmError> {
+        value.ok_or_else(|| VmError::RuntimeException("NullPointerException".to_string()))
     }
 
     fn pop_int(&self, memory: &mut VirtualMemory) -> Result<i32, VmError> {
@@ -488,6 +821,9 @@ impl MnemonicFallback for DecodedInstructionKind {
     fn mnemonic_fallback(&self) -> &'static str {
         match self {
             DecodedInstructionKind::Ldc(_) => "ldc",
+            DecodedInstructionKind::ALoad(_) => "aload",
+            DecodedInstructionKind::AStore(_) => "astore",
+            DecodedInstructionKind::Dup => "dup",
             DecodedInstructionKind::IfICmpEq(_) => "if_icmpeq",
             DecodedInstructionKind::IfICmpNe(_) => "if_icmpne",
             DecodedInstructionKind::IfICmpLt(_) => "if_icmplt",
@@ -496,6 +832,11 @@ impl MnemonicFallback for DecodedInstructionKind {
             DecodedInstructionKind::IfICmpLe(_) => "if_icmple",
             DecodedInstructionKind::IInc { .. } => "iinc",
             DecodedInstructionKind::InvokeStatic(_) => "invokestatic",
+            DecodedInstructionKind::InvokeSpecial(_) => "invokespecial",
+            DecodedInstructionKind::New(_) => "new",
+            DecodedInstructionKind::GetField(_) => "getfield",
+            DecodedInstructionKind::PutField(_) => "putfield",
+            DecodedInstructionKind::AReturn => "areturn",
             _ => "unsupported",
         }
     }

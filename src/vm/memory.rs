@@ -24,6 +24,9 @@ impl MethodArea {
         self.classes.push(RuntimeClass {
             id,
             name: name.clone(),
+            fields: Vec::new(),
+            class_refs: HashMap::new(),
+            field_refs: HashMap::new(),
             methods: Vec::new(),
             method_refs: HashMap::new(),
             state: crate::vm::class::ClassState::Loaded,
@@ -92,6 +95,10 @@ impl Heap {
 
     pub fn get(&self, reference: ObjectRef) -> Option<&HeapEntry> {
         self.objects.get(reference.0)
+    }
+
+    pub fn get_mut(&mut self, reference: ObjectRef) -> Option<&mut HeapEntry> {
+        self.objects.get_mut(reference.0)
     }
 }
 
