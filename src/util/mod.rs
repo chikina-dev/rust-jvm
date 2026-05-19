@@ -1,2 +1,2 @@
-pub mod hex;
 pub mod class;
+pub mod hex;

@@ -2,11 +2,11 @@ use phf::phf_map;
 
 #[derive(Debug, Clone)]
 pub struct CodeByte {
-  pub name: &'static str,
-  pub opcode: u8,
-  pub length: u8,
-  pub stack_behavior: &'static str,
-  pub data: Vec<u8>,
+    pub name: &'static str,
+    pub opcode: u8,
+    pub length: u8,
+    pub stack_behavior: &'static str,
+    pub data: Vec<u8>,
 }
 
 pub static CODE_BYTES: phf::Map<u8, CodeByte> = phf_map! {
