@@ -2,9 +2,9 @@
 
 use std::{ mem::discriminant };
 
-use nom::{ bytes::complete::take, error::ErrorKind, multi::count, number::complete::{ be_u16, be_u32, be_u8 }, Err, IResult, Parser};
+use nom::{ bytes::complete::take, error::ErrorKind, multi::count, number::complete::{ be_i32, be_u16, be_u32, be_u8 }, IResult, Parser};
 
-use crate::{structure::code::{CodeByte, CODE_BYTES}, util::{class::{method_access_flags, parse_constant_pool}, hex::{hex_utf8, hex_viewer}}};
+use crate::{structure::code::{CodeByte, CODE_BYTES}, util::{class::parse_constant_pool, hex::hex_utf8}};
 
 #[derive(Debug, Default)]
 pub struct Header {
@@ -106,6 +106,18 @@ pub struct Attribute {
   pub info: Vec<u8>,
 }
 
+impl Attribute {
+  fn parse_unknown(input: &[u8], attribute_name_index: u16) -> IResult<&[u8], Self> {
+    let (input, attribute_length) = be_u32(input)?;
+    let (input, info) = take(attribute_length as usize)(input)?;
+    Ok((input, Attribute {
+      attribute_name_index,
+      attribute_length,
+      info: info.to_vec(),
+    }))
+  }
+}
+
 #[derive(Debug, Default)]
 pub struct ClassFileAttributes {
   pub attributes_count: u16,
@@ -133,6 +145,7 @@ pub enum ClassFileAttribute {
   Synthetic(SyntheticAttribute),
   Deprecated(DeprecatedAttribute),
   Signature(SignatureAttribute),
+  Unknown(Attribute),
 }
 
 impl ClassFileAttribute {
@@ -462,7 +475,10 @@ impl ClassFileAttribute {
           signature_index,
         })))
       },
-      _ => Err(nom::Err::Error(nom::error::Error::new(input, ErrorKind::Tag))),
+      _ => {
+        let (input, attribute) = Attribute::parse_unknown(input, index)?;
+        Ok((input, Self::Unknown(attribute)))
+      },
     }
   }
 }
@@ -483,6 +499,7 @@ pub enum FieldInfoAttribute {
   RuntimeInvisibleAnnotations(RuntimeInvisibleAnnotationsAttribute),
   RuntimeVisibleTypeAnnotations(RuntimeVisibleTypeAnnotationsAttribute),
   RuntimeInvisibleTypeAnnotations(RuntimeInvisibleTypeAnnotationsAttribute),
+  Unknown(Attribute),
 }
 
 impl FieldInfoAttribute {
@@ -570,7 +587,10 @@ impl FieldInfoAttribute {
           annotations,
         })))
       },
-      _ => Err(nom::Err::Error(nom::error::Error::new(input, ErrorKind::Tag))),
+      _ => {
+        let (input, attribute) = Attribute::parse_unknown(input, index)?;
+        Ok((input, Self::Unknown(attribute)))
+      },
     }
   }
 }
@@ -596,6 +616,80 @@ pub enum MethodInfoAttribute {
   RuntimeInvisibleTypeAnnotations(RuntimeInvisibleTypeAnnotationsAttribute),
   RuntimeVisibleParameterAnnotations(RuntimeVisibleParameterAnnotationsAttribute),
   RuntimeInvisibleParameterAnnotations(RuntimeInvisibleParameterAnnotationsAttribute),
+  Unknown(Attribute),
+}
+
+fn unknown_code_byte(opcode: u8) -> CodeByte {
+  CodeByte {
+    name: "Unknown",
+    opcode,
+    length: 1,
+    stack_behavior: "Unknown bytecode",
+    data: Vec::new(),
+  }
+}
+
+fn parse_switch_padding(opcode_pc: usize) -> usize {
+  (4 - ((opcode_pc + 1) % 4)) % 4
+}
+
+fn parse_code_bytes(input: &[u8], code_length: usize) -> IResult<&[u8], Vec<CodeByte>> {
+  let (input, code_input) = take(code_length)(input)?;
+  let mut remaining = code_input;
+  let mut code = Vec::new();
+  let mut pc = 0usize;
+
+  while pc < code_length {
+    let opcode_pc = pc;
+    let (rest, opcode) = be_u8(remaining)?;
+    remaining = rest;
+    pc += 1;
+
+    let mut code_byte = CODE_BYTES.get(&opcode).cloned().unwrap_or_else(|| unknown_code_byte(opcode));
+    let operand_len = match opcode {
+      0xaa => {
+        let padding = parse_switch_padding(opcode_pc);
+        let after_padding = remaining
+          .get(padding..)
+          .ok_or_else(|| nom::Err::Error(nom::error::Error::new(remaining, ErrorKind::Eof)))?;
+        let (after_default, _) = be_i32(after_padding)?;
+        let (after_low, low) = be_i32(after_default)?;
+        let (_, high) = be_i32(after_low)?;
+        if high < low {
+          return Err(nom::Err::Error(nom::error::Error::new(after_low, ErrorKind::Verify)));
+        }
+        let jump_count = (high as i64 - low as i64 + 1) as usize;
+        padding + 12 + jump_count * 4
+      },
+      0xab => {
+        let padding = parse_switch_padding(opcode_pc);
+        let after_padding = remaining
+          .get(padding..)
+          .ok_or_else(|| nom::Err::Error(nom::error::Error::new(remaining, ErrorKind::Eof)))?;
+        let (after_default, _) = be_i32(after_padding)?;
+        let (_, npairs) = be_i32(after_default)?;
+        if npairs < 0 {
+          return Err(nom::Err::Error(nom::error::Error::new(after_default, ErrorKind::Verify)));
+        }
+        padding + 8 + npairs as usize * 8
+      },
+      0xc4 => {
+        let modified_opcode = *remaining
+          .first()
+          .ok_or_else(|| nom::Err::Error(nom::error::Error::new(remaining, ErrorKind::Eof)))?;
+        if modified_opcode == 0x84 { 5 } else { 3 }
+      },
+      _ => code_byte.length.saturating_sub(1) as usize,
+    };
+
+    let (rest, data) = take(operand_len)(remaining)?;
+    remaining = rest;
+    pc += operand_len;
+    code_byte.data = data.to_vec();
+    code.push(code_byte);
+  }
+
+  Ok((input, code))
 }
 
 impl MethodInfoAttribute {
@@ -606,39 +700,7 @@ impl MethodInfoAttribute {
         let (input, max_stack) = be_u16(input)?;
         let (input, max_locals) = be_u16(input)?;
         let (input, code_length) = be_u32(input)?;
-        let mut code: Vec<CodeByte> = Vec::new();
-        let mut code_length_buffer = code_length as usize;
-        let mut input = input;
-
-        while code_length_buffer > 0 {
-            let (input_inner, byte) = be_u8(input)?;
-            code_length_buffer -= 1;
-            input = input_inner;
-
-            let code_byte: CodeByte = CODE_BYTES.get(&byte).cloned().unwrap_or(
-                CodeByte {
-                    name: "Unknown",
-                    opcode: byte,
-                    length: 1,
-                    stack_behavior: "Unknown bytecode",
-                    data: Vec::new(),
-                }
-            );
-            if code_byte.length == 1 {
-                code.push(code_byte);
-            } else {
-                let mut data = Vec::new();
-                for _ in 1..code_byte.length {
-                    let (input_inner, next_byte) = be_u8(input)?;
-                    code_length_buffer -= 1;
-                    input = input_inner;
-                    data.push(next_byte);
-                }
-                let mut full_code_byte = code_byte.clone();
-                full_code_byte.data = data;
-                code.push(full_code_byte);
-            }
-        }
+        let (input, code) = parse_code_bytes(input, code_length as usize)?;
         let (input, exception_table_length) = be_u16(input)?;
         fn exception_entry(input: &[u8]) -> IResult<&[u8], ExceptionTableEntry> {
           let (input, start_pc) = be_u16(input)?;
@@ -820,7 +882,10 @@ impl MethodInfoAttribute {
           parameter_annotations,
         })))
       },
-      _ => Err(nom::Err::Error(nom::error::Error::new(input, ErrorKind::Tag))),
+      _ => {
+        let (input, attribute) = Attribute::parse_unknown(input, index)?;
+        Ok((input, Self::Unknown(attribute)))
+      },
     }
   }
 }
@@ -839,6 +904,7 @@ pub enum CodeNestedAttribute {
   StackMapTable(StackMapTableAttribute),
   RuntimeVisibleTypeAnnotations(RuntimeVisibleTypeAnnotationsAttribute),
   RuntimeInvisibleTypeAnnotations(RuntimeInvisibleTypeAnnotationsAttribute),
+  Unknown(Attribute),
 }
 
 impl CodeNestedAttribute {
@@ -985,7 +1051,10 @@ impl CodeNestedAttribute {
         };
         Ok((input, Self::RuntimeInvisibleTypeAnnotations(parsed)))
       },
-      _ => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
+      _ => {
+        let (input, attribute) = Attribute::parse_unknown(input, index)?;
+        Ok((input, Self::Unknown(attribute)))
+      },
     }
   }
 }
@@ -1004,6 +1073,7 @@ pub enum RecordComponentInfoAttribute {
   RuntimeInvisibleAnnotations(RuntimeInvisibleAnnotationsAttribute),
   RuntimeVisibleTypeAnnotations(RuntimeVisibleTypeAnnotationsAttribute),
   RuntimeInvisibleTypeAnnotations(RuntimeInvisibleTypeAnnotationsAttribute),
+  Unknown(Attribute),
 }
 
 impl RecordComponentInfoAttribute {
@@ -1107,7 +1177,10 @@ impl RecordComponentInfoAttribute {
         };
         Ok((input, Self::RuntimeInvisibleTypeAnnotations(parsed)))
       },
-      _ => Err(nom::Err::Error(nom::error::Error::new(input, ErrorKind::Tag))),
+      _ => {
+        let (input, attribute) = Attribute::parse_unknown(input, index)?;
+        Ok((input, Self::Unknown(attribute)))
+      },
     }
   }
 }
@@ -1379,7 +1452,7 @@ pub enum StackMapFrame {
     stack: Vec<VerificationTypeInfo>,
   },
   SameLocals1StackItemFrameExtended {
-    frame_type: u8, // 64-127
+    frame_type: u8, // 247
     offset_delta: u16,
     stack: Vec<VerificationTypeInfo>,
   },
@@ -1417,11 +1490,12 @@ impl StackMapFrame {
         let (input, stack) = VerificationTypeInfo::parse_vec(input)?;
         Ok((input, StackMapFrame::SameLocals1StackItemFrame { frame_type, stack }))
       },
-      128..=247 => {
+      247 => {
         let (input, offset_delta) = be_u16(input)?;
         let (input, stack) = VerificationTypeInfo::parse_vec(input)?;
         Ok((input, StackMapFrame::SameLocals1StackItemFrameExtended { frame_type, offset_delta, stack }))
       },
+      128..=246 => Err(nom::Err::Error(nom::error::Error::new(input, ErrorKind::Tag))),
       248..=250 => {
         let (input, offset_delta) = be_u16(input)?;
         Ok((input, StackMapFrame::ChopFrame { frame_type, offset_delta }))
@@ -1471,43 +1545,36 @@ pub enum VerificationTypeInfo {
 }
 
 impl VerificationTypeInfo {
-  pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<Self>> {
-    let mut input = input;
-    let mut vec = Vec::new();
+  fn parse_one(input: &[u8]) -> IResult<&[u8], Self> {
+    let (input, tag) = be_u8(input)?;
 
-    while !input.is_empty() {
-      let (rest, tag) = be_u8(input)?;
-      input = rest;
-
-      let verification_type_info = match tag {
-        0 => VerificationTypeInfo::TopVariableInfo { tag },
-        1 => VerificationTypeInfo::IntegerVariableInfo { tag },
-        2 => VerificationTypeInfo::FloatVariableInfo { tag },
-        3 => VerificationTypeInfo::LongVariableInfo { tag },
-        4 => VerificationTypeInfo::DoubleVariableInfo { tag },
-        5 => VerificationTypeInfo::NullVariableInfo { tag },
-        6 => VerificationTypeInfo::UninitializedThisVariableInfo { tag },
-        7 => {
-          let (rest, cpool_index) = be_u16(input)?;
-          input = rest;
-          VerificationTypeInfo::ObjectVariableInfo { tag, cpool_index }
-        },
-        8 => {
-          let (rest, offset) = be_u16(input)?;
-          input = rest;
-          VerificationTypeInfo::UninitializedVariableInfo { tag, offset }
-        },
-        _ => return Err(nom::Err::Error(nom::error::Error::new(input, ErrorKind::Tag))),
-      };
-
-      vec.push(verification_type_info);
+    match tag {
+      0 => Ok((input, VerificationTypeInfo::TopVariableInfo { tag })),
+      1 => Ok((input, VerificationTypeInfo::IntegerVariableInfo { tag })),
+      2 => Ok((input, VerificationTypeInfo::FloatVariableInfo { tag })),
+      3 => Ok((input, VerificationTypeInfo::LongVariableInfo { tag })),
+      4 => Ok((input, VerificationTypeInfo::DoubleVariableInfo { tag })),
+      5 => Ok((input, VerificationTypeInfo::NullVariableInfo { tag })),
+      6 => Ok((input, VerificationTypeInfo::UninitializedThisVariableInfo { tag })),
+      7 => {
+        let (input, cpool_index) = be_u16(input)?;
+        Ok((input, VerificationTypeInfo::ObjectVariableInfo { tag, cpool_index }))
+      },
+      8 => {
+        let (input, offset) = be_u16(input)?;
+        Ok((input, VerificationTypeInfo::UninitializedVariableInfo { tag, offset }))
+      },
+      _ => Err(nom::Err::Error(nom::error::Error::new(input, ErrorKind::Tag))),
     }
+  }
 
-    Ok((input, vec))
+  pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<Self>> {
+    Self::parse_vec(input)
   }
 
   pub fn parse_vec(input: &[u8]) -> IResult<&[u8], Vec<Self>> {
-    Self::parse(input)
+    let (input, verification_type_info) = Self::parse_one(input)?;
+    Ok((input, vec![verification_type_info]))
   }
 
   pub fn parse_vec_with_count(input: &[u8], count: usize) -> IResult<&[u8], Vec<Self>> {
@@ -1515,9 +1582,9 @@ impl VerificationTypeInfo {
     let mut vec = Vec::with_capacity(count);
 
     for _ in 0..count {
-      let (rest, verification_type_info) = Self::parse(input)?;
+      let (rest, verification_type_info) = Self::parse_one(input)?;
       input = rest;
-      vec = verification_type_info;
+      vec.push(verification_type_info);
     }
 
     Ok((input, vec))
@@ -1628,7 +1695,7 @@ pub struct TypeAnnotation {
 impl TypeAnnotation {
   pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
     let (input, target_type) = be_u8(input)?;
-    let (input, target_info) = TargetInfo::parse(input)?;
+    let (input, target_info) = TargetInfo::parse(input, target_type)?;
     let (input, target_path) = TypePath::parse(input)?;
     let (input, type_index) = be_u16(input)?;
     let (mut input, num_element_value_pairs) = be_u16(input)?;
@@ -1721,33 +1788,31 @@ impl Default for TargetInfo {
 }
 
 impl TargetInfo {
-  fn parse(input: &[u8]) -> IResult<&[u8], Self> {
-    let (input, target_type) = be_u8(input)?;
-
+  fn parse(input: &[u8], target_type: u8) -> IResult<&[u8], Self> {
     match target_type {
-      0 => {
+      0x00 | 0x01 => {
         let (input, type_parameter_index) = be_u8(input)?;
         Ok((input, TargetInfo::TypeParameter { type_parameter_index }))
       },
-      1 => {
+      0x10 => {
         let (input, supertype_index) = be_u16(input)?;
         Ok((input, TargetInfo::Supertype { supertype_index }))
       },
-      2 => {
+      0x11 | 0x12 => {
         let (input, type_parameter_index) = be_u8(input)?;
         let (input, bound_index) = be_u8(input)?;
         Ok((input, TargetInfo::TypeParameterBound { type_parameter_index, bound_index }))
       },
-      3 => Ok((input, TargetInfo::Empty {})),
-      4 => {
+      0x13 | 0x14 | 0x15 => Ok((input, TargetInfo::Empty {})),
+      0x16 => {
         let (input, formal_parameter_index) = be_u8(input)?;
         Ok((input, TargetInfo::FormalParameter { formal_parameter_index }))
       },
-      5 => {
+      0x17 => {
         let (input, throws_type_index) = be_u16(input)?;
         Ok((input, TargetInfo::Throws { throws_type_index }))
       },
-      6 => {
+      0x40 | 0x41 => {
         let (mut input, table_length) = be_u16(input)?;
         let mut local_var_table = Vec::with_capacity(table_length as usize);
 
@@ -1762,15 +1827,15 @@ impl TargetInfo {
 
         Ok((input, TargetInfo::Localvar { table_length, local_var_table }))
       },
-      7 => {
+      0x42 => {
         let (input, exception_table_index) = be_u16(input)?;
         Ok((input, TargetInfo::Catch { exception_table_index }))
       },
-      8 => {
+      0x43..=0x46 => {
         let (input, offset) = be_u16(input)?;
         Ok((input, TargetInfo::Offset { offset }))
       },
-      9 => {
+      0x47..=0x4B => {
         let (input, offset) = be_u16(input)?;
         let (input, type_argument_index) = be_u8(input)?;
         Ok((input, TargetInfo::TypeArgument { offset, type_argument_index }))
@@ -1801,12 +1866,12 @@ impl ElementValue {
     };
 
     match tag {
-      0x42 => { // 'B' for byte
-        let (input, const_value_index) = be_u8(input)?;
+      0x42 | 0x43 | 0x44 | 0x46 | 0x49 | 0x4A | 0x53 | 0x5A | 0x73 => {
+        let (input, const_value_index) = be_u16(input)?;
         value.value = ElementValueEnum::ConstValueIndex(const_value_index);
         Ok((input, value))
       },
-      0x45 => { // 'E' for enum
+      0x65 => { // 'e' for enum
         let (input, type_name_index) = be_u16(input)?;
         let (input, const_name_index) = be_u16(input)?;
         value.value = ElementValueEnum::EnumConstValue {
@@ -1815,8 +1880,8 @@ impl ElementValue {
         };
         Ok((input, value))
       },
-      0x43 => { // 'C' for class
-        let (input, class_info_index) = be_u8(input)?;
+      0x63 => { // 'c' for class
+        let (input, class_info_index) = be_u16(input)?;
         value.value = ElementValueEnum::ClassInfoIndex(class_info_index);
         Ok((input, value))
       },
@@ -1846,14 +1911,14 @@ impl ElementValue {
 
 #[derive(Debug)]
 pub enum ElementValueEnum {
-  ConstValueIndex(u8),
+  ConstValueIndex(u16),
 
   EnumConstValue {
     type_name_index: u16,
     const_name_index: u16,
   },
 
-  ClassInfoIndex(u8),
+  ClassInfoIndex(u16),
 
   AnnotationValue(Annotation),
 
@@ -2008,19 +2073,19 @@ impl<'a> ClassFileParser {
     let (input, name_index) = be_u16(input)?;
     let (input, descriptor_index) = be_u16(input)?;
     let (input, attributes_count) = be_u16(input)?;
-    let name = match self.constant_pool.get_class(name_index).unwrap() {
-      Constant::Utf8 { bytes, .. } => hex_utf8(bytes),
+    match self.constant_pool.get_class(name_index) {
+      Ok(Constant::Utf8 { .. }) => {},
       _ => return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     };
-    let descriptor = match self.constant_pool.get_class(descriptor_index).unwrap() {
-      Constant::Utf8 { bytes, .. } => hex_utf8(bytes),
+    match self.constant_pool.get_class(descriptor_index) {
+      Ok(Constant::Utf8 { .. }) => {},
       _ => return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
     };
 
     let parse_method_info_attribute = |input: &'a [u8]| -> IResult<&'a [u8], MethodInfoAttribute> {
       let (input, index) = be_u16(input)?;
-      let name = match &self.constant_pool.get_class(index).unwrap() {
-        Constant::Utf8 { bytes, .. } => hex_utf8(bytes),
+      let name = match self.constant_pool.get_class(index) {
+        Ok(Constant::Utf8 { bytes, .. }) => hex_utf8(bytes),
         _ => return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
       };
       let (input, attribute) = MethodInfoAttribute::parse(input, &name, index, &self.constant_pool)?;

@@ -57,8 +57,9 @@ pub fn constant_pool_viewer(constant_pool: &[Constant]) {
 pub fn parse_constant_pool(count: u16, input: &[u8]) -> IResult<&[u8], ConstantPool> {
   let mut constants = Vec::new();
   let mut remaining_input = input;
+  let mut slot = 0;
 
-  for _ in 0..count {
+  while slot < count {
     let (input, tag) = be_u8(remaining_input)?;
 
     let constant: Constant = match tag {
@@ -104,12 +105,14 @@ pub fn parse_constant_pool(count: u16, input: &[u8]) -> IResult<&[u8], ConstantP
         let (input, high_bytes) = be_u32(input)?;
         let (input, low_bytes) = be_u32(input)?;
         remaining_input = input;
+        slot += 1;
         Constant::Long { high_bytes, low_bytes }
       },
       6 => {
         let (input, high_bytes) = be_u32(input)?;
         let (input, low_bytes) = be_u32(input)?;
         remaining_input = input;
+        slot += 1;
         Constant::Double { high_bytes, low_bytes }
       },
       12 => {
@@ -160,15 +163,20 @@ pub fn parse_constant_pool(count: u16, input: &[u8]) -> IResult<&[u8], ConstantP
       },
       _ => {
         println!("Unknown constant type: {}", tag);
-        Constant::Unknown
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
       },
     };
     constants.push(constant);
+    slot += 1;
+
+    if slot <= count && matches!(constants.last(), Some(Constant::Long { .. } | Constant::Double { .. })) {
+      constants.push(Constant::Unknown);
+    }
   }
 
   Ok((remaining_input, ConstantPool {
     constants,
-    count,
+    count: count + 1,
   }))
 }
 
